@@ -1,0 +1,29 @@
+schema_version: 1
+contract_version: 0.3.0
+repositories:
+  rl-learner:
+    branch: main
+    commit: 1da71b49130976071f1037756b3cf70767c55d5b
+  rl-aiserver:
+    branch: main
+    commit: f3fbc065c428c587e397a9d3c82235618bb51598
+  rl-sample-pool:
+    branch: main
+    commit: 6b129a86f8210e6882281a0baded1d9d6026e8d6
+  rl-model-distributor:
+    branch: main
+    commit: bebe3751f327ef4d6403aecd0019f427003e05d1
+  rl-contracts:
+    branch: main
+    commit: e13a875b057c6103ac903b87bb0c4a44b3e95649
+  rl-infra:
+    branch: main
+    commit: 31b929d8b40ac2a0731f6e3c28646c6c3ba26a60
+  maze-client:
+    branch: main
+    commit: b0e47208e711314a4ab4faece56c7bb6f73d8f6d
+artifacts:
+  contracts: "rl-contracts/0.3.0/<platform>"
+  sample_pool: "rl-sample-pool/0.3.0/<platform>"
+  model_distributor: "rl-model-distributor/0.2.0/<platform>"
+  smoke_model: "rl-smoke-model/0.2.0/any"

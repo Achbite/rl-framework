@@ -1,0 +1,14 @@
+{
+  "task_id": "m0-smoke-20260729-120000-0001",
+  "run_id": "m0-smoke-20260729-120000-0001-run-0001",
+  "attempt": 1,
+  "mode": "training",
+  "agents": 4,
+  "episodes": 3,
+  "max_steps": 256,
+  "images": {
+    "learner": "training-001",
+    "aiserver": "training-001",
+    "client": "training-001"
+  }
+}
