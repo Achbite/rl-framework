@@ -36,9 +36,11 @@ class DockerRuntime:
         self.runtime_root = self.workspace / ".workspace/runtime"
         if runtime_scope not in {"runs", "local-tests"}:
             raise ValueError(f"unsupported runtime scope: {runtime_scope}")
+        self.runtime_scope = runtime_scope
         self.run_root = self.runtime_root / runtime_scope / spec.run_id
         self.tunnel_root = self.runtime_root / "tunnels"
-        self.network = "rl-training-local"
+        run_key = hashlib.sha256(spec.run_id.encode("utf-8")).hexdigest()[:16]
+        self.network = f"rl-training-{run_key}"
         self._events = self._load_events()
 
     def _load_events(self) -> list[dict[str, Any]]:
@@ -130,6 +132,14 @@ class DockerRuntime:
             if not candidate.is_file():
                 raise RuntimeFailure(f"model file does not exist: {candidate}")
             model_path = str(candidate)
+        initial_checkpoint = None
+        if self.spec.initial_checkpoint:
+            candidate = Path(self.spec.initial_checkpoint)
+            if not candidate.is_file():
+                raise RuntimeFailure(
+                    f"initial checkpoint does not exist: {candidate}"
+                )
+            initial_checkpoint = str(candidate)
         images = {}
         for role in ("learner", "aiserver", "client"):
             image_ref = self.spec.image_ref(role)
@@ -162,12 +172,30 @@ class DockerRuntime:
             "docker_server_version": json.loads(info.stdout.strip()),
             "images": images,
             "model_path": model_path,
+            "initial_checkpoint": initial_checkpoint,
         }
 
     def _ensure_network(self) -> None:
         result = self._docker(["network", "inspect", self.network], check=False)
         if result.returncode != 0:
-            self._docker(["network", "create", self.network])
+            self._docker(
+                [
+                    "network",
+                    "create",
+                    "--label",
+                    "rl-training.managed=true",
+                    "--label",
+                    f"rl-training.run_id={self.spec.run_id}",
+                    self.network,
+                ]
+            )
+
+    def _remove_network(self) -> None:
+        result = self._docker(
+            ["network", "inspect", self.network], check=False
+        )
+        if result.returncode == 0:
+            self._docker(["network", "rm", self.network], check=False)
 
     def _managed_containers(self) -> list[str]:
         result = self._docker(
@@ -262,6 +290,7 @@ class DockerRuntime:
         for container_id in roles.get("learner", []):
             self._stop_and_remove(container_id, 5)
         self._stop_port_tunnels()
+        self._remove_network()
         if require_quiesce and quiesce_failures:
             failed = ", ".join(sorted(set(quiesce_failures)))
             raise RuntimeFailure(
@@ -539,8 +568,7 @@ class DockerRuntime:
     def _wait_metrics(self, timeout: float) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         expected = self.spec.expected_samples
-        query = urllib.parse.urlencode({"run_id": self.spec.run_id})
-        url = f"http://127.0.0.1:9005/api/metrics/latest?{query}"
+        url = "http://127.0.0.1:9005/api/metrics/latest"
         last_record: dict[str, Any] = {}
         while time.monotonic() < deadline:
             self._require_running("learner")
@@ -582,54 +610,113 @@ class DockerRuntime:
         )
 
     def _validate_training_artifacts(
-        self, models_root: Path
+        self, local_train_root: Path, current_version: int
     ) -> dict[str, Any]:
-        published = models_root / "published" / self.spec.run_id
-        checkpoints = models_root / "checkpoints" / self.spec.run_id
-        updates = models_root / "updates" / self.spec.run_id
-        manifests = []
-        checksums = []
-        for version in range(3):
+        runtime = local_train_root / "runtime"
+        published = runtime / "serving"
+        checkpoints = runtime / "checkpoints"
+        archive = local_train_root / "archive"
+        updates = runtime / "receipts"
+        if current_version < 2:
+            raise RuntimeFailure("training did not publish model v2")
+
+        receipts: dict[int, dict[str, Any]] = {}
+        for path in updates.glob("*.json"):
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+            if receipt.get("state") == "ACKED":
+                receipts[int(receipt["target_model_version"])] = receipt
+
+        identity_checksums: list[str] = []
+        archive_manifests: dict[int, dict[str, Any]] = {}
+        for version in (0, 2):
+            version_dir = archive / f"v{version:06d}"
+            manifest_path = (
+                version_dir / f"manifest_v{version:06d}.json"
+            )
+            if not manifest_path.is_file():
+                raise RuntimeFailure(
+                    f"training archive is missing: {manifest_path}"
+                )
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+            model_path = version_dir / str(manifest.get("model_file", ""))
+            checkpoint_path = version_dir / str(
+                manifest.get("checkpoint_file", "")
+            )
+            if not model_path.is_file() or not checkpoint_path.is_file():
+                raise RuntimeFailure(
+                    f"training archive v{version} is incomplete"
+                )
+            checksum = hashlib.sha256(model_path.read_bytes()).hexdigest()
+            if (
+                manifest.get("contract_version") != "0.5.0"
+                or manifest.get("model_version") != version
+                or manifest.get("sha256") != checksum
+                or "run_id" in manifest
+            ):
+                raise RuntimeFailure(
+                    f"archive v{version} identity is invalid"
+                )
+            archive_manifests[version] = manifest
+            if version == 0:
+                identity_checksums.append(checksum)
+
+        for version in (1, 2):
+            receipt = receipts.get(version)
+            checksum = (receipt or {}).get("manifest", {}).get("sha256")
+            if not isinstance(checksum, str) or len(checksum) != 64:
+                raise RuntimeFailure(
+                    f"model v{version} receipt identity is missing"
+                )
+            identity_checksums.append(checksum)
+        if len(set(identity_checksums)) != 3:
+            raise RuntimeFailure("v0, v1, and v2 checksums must differ")
+
+        v2_receipt = receipts.get(2, {})
+        v2_update_id = v2_receipt.get("train_update_id")
+        if not v2_update_id:
+            raise RuntimeFailure("model v2 update receipt is missing")
+        if (
+            v2_receipt.get("target_model_version") != 2
+            or v2_receipt.get("behavior_model_version") != 1
+            or not v2_receipt.get("archive_committed")
+        ):
+            raise RuntimeFailure(
+                "model v2 receipt must ACK behavior model v1 samples"
+            )
+
+        retained_versions = list(
+            range(max(0, current_version - 1), current_version + 1)
+        )
+        actual_retained = sorted(
+            int(path.stem.removeprefix("manifest_v"))
+            for path in published.glob("manifest_v*.json")
+        )
+        if actual_retained != retained_versions:
+            raise RuntimeFailure(
+                "runtime serving directory does not retain exactly two versions"
+            )
+        for version in retained_versions:
             manifest_path = published / f"manifest_v{version:06d}.json"
             model_path = published / f"model_v{version:06d}.onnx"
-            checkpoint_path = (
-                checkpoints / f"checkpoint_v{version:06d}.pt"
-            )
-            for path in (manifest_path, model_path, checkpoint_path):
-                if not path.is_file():
-                    raise RuntimeFailure(
-                        f"training artifact is missing: {path}"
-                    )
+            checkpoint_path = checkpoints / f"checkpoint_v{version:06d}.pt"
             manifest = json.loads(
                 manifest_path.read_text(encoding="utf-8")
             )
             checksum = hashlib.sha256(model_path.read_bytes()).hexdigest()
             if (
-                manifest.get("run_id") != self.spec.run_id
+                manifest.get("contract_version") != "0.5.0"
                 or manifest.get("model_version") != version
                 or manifest.get("sha256") != checksum
+                or not checkpoint_path.is_file()
+                or "run_id" in manifest
             ):
                 raise RuntimeFailure(
-                    f"model v{version} manifest identity is invalid"
+                    f"runtime model v{version} identity is invalid"
                 )
-            manifests.append(manifest)
-            checksums.append(checksum)
-        if len(set(checksums)) != 3:
-            raise RuntimeFailure("v0, v1, and v2 checksums must differ")
-
-        v2_update_id = manifests[2].get("train_update_id")
-        receipt_path = updates / f"{v2_update_id}.json"
-        if not v2_update_id or not receipt_path.is_file():
-            raise RuntimeFailure("model v2 update receipt is missing")
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        if (
-            receipt.get("state") != "ACKED"
-            or receipt.get("target_model_version") != 2
-            or receipt.get("behavior_model_version") != 1
-        ):
-            raise RuntimeFailure(
-                "model v2 receipt must ACK behavior model v1 samples"
-            )
+        if (published / "manifest_v000000.json").exists():
+            raise RuntimeFailure("runtime v0 was not removed by retention")
 
         checkpoint_probe = self._docker(
             [
@@ -646,23 +733,27 @@ class DockerRuntime:
                     "'update':p.get('metadata',{}).get('train_update_id')}))"
                 ),
                 (
-                    "/opt/rl/learner/models/checkpoints/"
-                    f"{self.spec.run_id}/checkpoint_v000002.pt"
+                    "/opt/rl/learner/models/local-train/runtime/checkpoints/"
+                    f"checkpoint_v{current_version:06d}.pt"
                 ),
             ]
         )
         checkpoint = json.loads(checkpoint_probe.stdout)
         if (
-            checkpoint.get("version") != 2
+            checkpoint.get("version") != current_version
             or not checkpoint.get("optimizer")
-            or checkpoint.get("update") != v2_update_id
+            or not checkpoint.get("update")
         ):
-            raise RuntimeFailure("model v2 checkpoint identity is invalid")
+            raise RuntimeFailure(
+                "current runtime checkpoint identity is invalid"
+            )
         return {
-            "versions": [0, 1, 2],
-            "checksums": checksums,
+            "runtime_versions": retained_versions,
+            "archived_versions": [0, 2],
+            "identity_checksums_v0_v1_v2": identity_checksums,
             "v2_train_update_id": v2_update_id,
             "v2_behavior_model_version": 1,
+            "current_version": current_version,
         }
 
     def _wait_container_exit(self, role: str, timeout: float) -> int:
@@ -678,8 +769,6 @@ class DockerRuntime:
 
     def _base_env(self) -> list[str]:
         return [
-            "--env",
-            f"MAZE_RUN_ID={self.spec.run_id}",
             "--env",
             "MAZE_AISERVER_ID=aiserver-0",
             "--env",
@@ -719,39 +808,68 @@ class DockerRuntime:
 
     def _start_training(self) -> dict[str, Any]:
         learner_logs = self.run_root / "learner/logs"
-        learner_models = self.run_root / "learner/models"
+        learner_local_train = self.run_root / "learner-local-train"
+        aiserver_local_train = self.run_root / "aiserver-local-train"
         aiserver_logs = self.run_root / "aiserver/log"
         client_logs = self.run_root / "client/log"
         for directory in (
             learner_logs,
-            learner_models,
+            learner_local_train,
+            aiserver_local_train,
             aiserver_logs,
             client_logs,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
+        learner_arguments = [
+            *self._base_env(),
+            "--env",
+            "MAZE_LEARNER_ID=learner-0",
+            "--env",
+            "MAZE_WORKLOAD=training",
+            "--env",
+            "MAZE_SAMPLE_DISTRIBUTOR_HOST=maze-aiserver",
+            "--env",
+            "MAZE_AISERVER_HOST=maze-aiserver",
+            "--env",
+            "MAZE_LOCAL_TRAIN_ROOT=/opt/rl/learner/models/local-train",
+            "--publish",
+            "127.0.0.1:9005:9005",
+            "--publish",
+            "127.0.0.1:9200:9200",
+            "--volume",
+            f"{learner_logs}:/opt/rl/learner/logs",
+            "--volume",
+            (
+                f"{learner_local_train}:"
+                "/opt/rl/learner/models/local-train"
+            ),
+        ]
+        if self.runtime_scope == "local-tests":
+            learner_arguments.extend(
+                ["--env", "MAZE_ARCHIVE_INTERVAL_UPDATES=2"]
+            )
+        if self.spec.initial_checkpoint:
+            checkpoint = Path(self.spec.initial_checkpoint)
+            container_checkpoint = (
+                "/opt/rl/learner/initial-checkpoint/"
+                f"{checkpoint.name}"
+            )
+            learner_arguments.extend(
+                [
+                    "--volume",
+                    (
+                        f"{checkpoint.parent}:"
+                        "/opt/rl/learner/initial-checkpoint:ro"
+                    ),
+                    "--env",
+                    f"MAZE_INITIAL_CHECKPOINT={container_checkpoint}",
+                ]
+            )
         self._run_container(
             "learner",
             self.spec.image_ref("learner"),
-            [
-                *self._base_env(),
-                "--env",
-                "MAZE_LEARNER_ID=learner-0",
-                "--env",
-                "MAZE_WORKLOAD=training",
-                "--env",
-                "MAZE_SAMPLE_DISTRIBUTOR_HOST=maze-aiserver",
-                "--env",
-                "MAZE_AISERVER_HOST=maze-aiserver",
-                "--publish",
-                "127.0.0.1:9005:9005",
-                "--publish",
-                "127.0.0.1:9200:9200",
-                "--volume",
-                f"{learner_logs}:/opt/rl/learner/logs",
-                "--volume",
-                f"{learner_models}:/opt/rl/learner/models",
-            ],
+            learner_arguments,
         )
         self._ensure_host_port(9200, 180)
         self._ensure_host_port(9005, 180)
@@ -768,12 +886,19 @@ class DockerRuntime:
                 "MAZE_MODEL_DISTRIBUTOR_HOST=maze-learner",
                 "--env",
                 "MAZE_SAMPLE_DISTRIBUTOR_HOST=127.0.0.1",
+                "--env",
+                "MAZE_LOCAL_TRAIN_ROOT=/opt/rl/aiserver/models/local-train",
                 "--publish",
                 "127.0.0.1:9002:9002",
                 "--publish",
                 "127.0.0.1:9100:9100",
                 "--volume",
                 f"{aiserver_logs}:/opt/rl/aiserver/log",
+                "--volume",
+                (
+                    f"{aiserver_local_train}:"
+                    "/opt/rl/aiserver/models/local-train"
+                ),
             ],
         )
         self._ensure_host_port(9100, 30)
@@ -815,7 +940,10 @@ class DockerRuntime:
         self._record("client_completed")
 
         metrics = self._wait_metrics(180)
-        artifacts = self._validate_training_artifacts(learner_models)
+        current_version = int(metrics["learner"]["model_version"])
+        artifacts = self._validate_training_artifacts(
+            learner_local_train, current_version
+        )
         client_ports = self._docker(
             [
                 "inspect",
@@ -859,6 +987,10 @@ class DockerRuntime:
             "models": artifacts,
             "train_updates": int(metrics["learner"]["train_updates"]),
             "trained_samples": int(metrics["learner"]["trained_samples"]),
+            "monitor_url": (
+                "http://127.0.0.1:9010/infra?"
+                f"source=local-dev&run_id={urllib.parse.quote(self.spec.run_id)}"
+            ),
             "ports": {
                 "aiserver": 9002,
                 "learner_metrics": 9005,
@@ -930,7 +1062,6 @@ class DockerRuntime:
                 )
             model_identity = {
                 "source": "embedded-smoke",
-                "run_id": manifest.get("run_id"),
                 "version": manifest.get("model_version"),
                 "sha256": actual_checksum,
                 "seed": manifest.get("seed"),
@@ -958,8 +1089,6 @@ class DockerRuntime:
                 *self._base_env(),
                 "--env",
                 f"MAZE_WORKLOAD={self.spec.mode}",
-                "--env",
-                f"MAZE_VALIDATION_ID={self.spec.run_id}",
                 "--env",
                 "MAZE_VALIDATION_RESULT_PATH=/opt/rl/maze-client/replays/client-result.json",
                 "--env",
@@ -1062,10 +1191,9 @@ class DockerRuntime:
         }
         metrics = {}
         if self.spec.mode == "training" and containers["learner"].get("running"):
-            query = urllib.parse.urlencode({"run_id": self.spec.run_id})
             try:
                 metrics = self._http_json(
-                    f"http://127.0.0.1:9005/api/metrics/latest?{query}"
+                    "http://127.0.0.1:9005/api/metrics/latest"
                 ).get("record", {})
             except RuntimeFailure:
                 metrics = {}

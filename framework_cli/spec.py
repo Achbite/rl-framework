@@ -35,6 +35,7 @@ class RunSpec:
     max_steps: int
     image_tags: dict[str, str]
     model_path: str | None
+    initial_checkpoint: str | None
     source_path: Path
 
     @property
@@ -101,6 +102,27 @@ def load_run_spec(path: str) -> RunSpec:
     elif model_path is not None and not isinstance(model_path, str):
         raise SpecError("model_path must be a string")
 
+    initial_checkpoint = document.get("initial_checkpoint")
+    if initial_checkpoint is not None:
+        if mode != "training":
+            raise SpecError(
+                "initial_checkpoint is supported only for training"
+            )
+        if (
+            not isinstance(initial_checkpoint, str)
+            or not initial_checkpoint
+        ):
+            raise SpecError(
+                "initial_checkpoint must be a non-empty path"
+            )
+        initial_checkpoint = str(
+            Path(initial_checkpoint).expanduser().resolve()
+        )
+    if "resume_from" in document:
+        raise SpecError(
+            "resume_from was removed; use initial_checkpoint"
+        )
+
     return RunSpec(
         task_id=task_id,
         run_id=run_id,
@@ -111,5 +133,6 @@ def load_run_spec(path: str) -> RunSpec:
         max_steps=max_steps,
         image_tags=image_tags,
         model_path=model_path,
+        initial_checkpoint=initial_checkpoint,
         source_path=source,
     )

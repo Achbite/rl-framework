@@ -51,6 +51,27 @@ class RunSpecTest(unittest.TestCase):
         with self.assertRaises(SpecError):
             load_run_spec(str(self.write(document)))
 
+    def test_initial_checkpoint_is_explicit_and_training_only(self):
+        document = self.baseline()
+        document["initial_checkpoint"] = "/tmp/checkpoint.pt"
+        spec = load_run_spec(str(self.write(document)))
+        self.assertEqual(
+            spec.initial_checkpoint,
+            str(Path("/tmp/checkpoint.pt").resolve()),
+        )
+
+        document["mode"] = "inference-smoke"
+        with self.assertRaisesRegex(
+            SpecError, "supported only for training"
+        ):
+            load_run_spec(str(self.write(document)))
+
+    def test_removed_resume_from_is_rejected(self):
+        document = self.baseline()
+        document["resume_from"] = "/tmp/savepoint"
+        with self.assertRaisesRegex(SpecError, "was removed"):
+            load_run_spec(str(self.write(document)))
+
     def test_rejects_full_image_reference(self):
         document = self.baseline()
         document["images"]["learner"] = "registry/repo:test-001"

@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -32,6 +33,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                 "client": "training-001",
             },
             model_path=None,
+            initial_checkpoint=None,
             source_path=Path(self.workspace.name) / "run.json",
         )
 
@@ -103,6 +105,52 @@ class RuntimePortTransportTest(unittest.TestCase):
             arguments,
         )
 
+    def test_component_environment_excludes_platform_run_identity(self):
+        runtime = DockerRuntime(self.spec)
+        environment = runtime._base_env()
+        self.assertNotIn("MAZE_RUN_ID", " ".join(environment))
+        self.assertNotIn(self.spec.run_id, " ".join(environment))
+
+    def test_runs_have_distinct_networks_and_storage_roots(self):
+        first = DockerRuntime(self.spec)
+        second_spec = replace(
+            self.spec,
+            run_id="m0-test-20260729-120000-0001-run-0002",
+            attempt=2,
+        )
+        second = DockerRuntime(second_spec)
+        self.assertNotEqual(first.network, second.network)
+        self.assertNotEqual(first.run_root, second.run_root)
+        self.assertEqual(
+            first.run_root / "learner-local-train",
+            Path(self.workspace.name).resolve()
+            / ".workspace/runtime/runs"
+            / self.spec.run_id
+            / "learner-local-train",
+        )
+        self.assertEqual(
+            first.run_root / "aiserver-local-train",
+            Path(self.workspace.name).resolve()
+            / ".workspace/runtime/runs"
+            / self.spec.run_id
+            / "aiserver-local-train",
+        )
+
+    def test_network_is_labeled_with_platform_run_identity(self):
+        runtime = DockerRuntime(self.spec)
+        inspect = mock.Mock(returncode=1, stdout="", stderr="")
+        created = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(
+            runtime, "_docker", side_effect=[inspect, created]
+        ) as docker:
+            runtime._ensure_network()
+        create_arguments = docker.call_args_list[1].args[0]
+        self.assertIn(
+            f"rl-training.run_id={self.spec.run_id}",
+            create_arguments,
+        )
+        self.assertEqual(create_arguments[-1], runtime.network)
+
     def test_training_stop_quiesces_producer_before_consumer(self):
         runtime = DockerRuntime(self.spec)
         roles = {
@@ -137,6 +185,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                 ),
             ),
             mock.patch.object(runtime, "_stop_port_tunnels"),
+            mock.patch.object(runtime, "_remove_network"),
         ):
             runtime.stop_run()
 
@@ -178,6 +227,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                 ),
             ),
             mock.patch.object(runtime, "_stop_port_tunnels"),
+            mock.patch.object(runtime, "_remove_network"),
         ):
             with self.assertRaisesRegex(Exception, "aiserver, learner"):
                 runtime.stop_run(require_quiesce=True)

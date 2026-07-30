@@ -18,6 +18,15 @@ Run the local four-agent training loop:
 ./framework local-test --profile training --json
 ```
 
+Components clear their own `local-train` directories and start from zero by default. Initialize from an explicit complete checkpoint with:
+
+```bash
+./framework local-test \
+  --profile training \
+  --initial-checkpoint /absolute/path/checkpoint_v000200.pt \
+  --json
+```
+
 Evaluate an explicit ONNX model locally:
 
 ```bash
@@ -36,7 +45,7 @@ Use an existing RunSpec:
 ./framework stop --run-spec run-spec.json --json
 ```
 
-The default image tag is `training-001`. Runtime data is stored under `.workspace/runtime` in the project root. Training metrics use port `9005`, and local replay uses port `9004`.
+The default image tag is `training-001`. Framework creates a dedicated Docker network plus `learner-local-train` and `aiserver-local-train` directories for every Run. Task and Run identity remain in Docker labels and external receipts only. Training metrics use `9005` without replay; `9004` is reserved for inference and model evaluation.
 
 ## Tests
 

@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     local.add_argument("--episodes", type=int)
     local.add_argument("--max-steps", type=int)
     local.add_argument("--model-path")
+    local.add_argument("--initial-checkpoint")
     local.add_argument("--keep-running", action="store_true")
     add_output_option(local)
     return parser
@@ -58,6 +59,10 @@ def local_test_spec(args: argparse.Namespace) -> Path:
         raise SpecError("agents, episodes, and max-steps must be positive")
     if args.profile == "model-evaluation" and not args.model_path:
         raise SpecError("--model-path is required for model-evaluation")
+    if args.initial_checkpoint and args.profile != "training":
+        raise SpecError(
+            "--initial-checkpoint is supported only for training"
+        )
 
     timestamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
         "%Y%m%d-%H%M%S"
@@ -82,6 +87,10 @@ def local_test_spec(args: argparse.Namespace) -> Path:
     if args.model_path:
         document["model_path"] = str(
             Path(args.model_path).expanduser().resolve()
+        )
+    if args.initial_checkpoint:
+        document["initial_checkpoint"] = str(
+            Path(args.initial_checkpoint).expanduser().resolve()
         )
 
     run_root = (

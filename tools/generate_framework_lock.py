@@ -42,7 +42,7 @@ def main() -> int:
         branch = git(repo, "branch", "--show-current")
         rows.append((name, branch, commit))
 
-    lines = ["schema_version: 1", "contract_version: 0.3.0", "repositories:"]
+    lines = ["schema_version: 1", "contract_version: 0.5.0", "repositories:"]
     for name, branch, commit in rows:
         lines.extend(
             [
@@ -54,10 +54,10 @@ def main() -> int:
     lines.extend(
         [
             "artifacts:",
-            '  contracts: "rl-contracts/0.3.0/<platform>"',
-            '  sample_pool: "rl-sample-pool/0.3.0/<platform>"',
-            '  model_distributor: "rl-model-distributor/0.2.0/<platform>"',
-            '  smoke_model: "rl-smoke-model/0.2.0/any"',
+            '  contracts: "rl-contracts/0.5.0/<platform>"',
+            '  sample_pool: "rl-sample-pool/0.5.0/<platform>"',
+            '  model_distributor: "rl-model-distributor/0.4.0/<platform>"',
+            '  smoke_model: "rl-smoke-model/0.4.0/any"',
         ]
     )
     output = framework_repo / "framework.lock.yaml"

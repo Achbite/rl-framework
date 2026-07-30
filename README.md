@@ -18,6 +18,15 @@
 ./framework local-test --profile training --json
 ```
 
+组件默认清理各自的 `local-train` 并从零训练。使用外部完整 checkpoint 初始化时：
+
+```bash
+./framework local-test \
+  --profile training \
+  --initial-checkpoint /absolute/path/checkpoint_v000200.pt \
+  --json
+```
+
 使用指定 ONNX 模型运行本地验证：
 
 ```bash
@@ -36,7 +45,7 @@
 ./framework stop --run-spec run-spec.json --json
 ```
 
-默认镜像 tag 为 `training-001`。运行数据保存在项目根目录的 `.workspace/runtime`，训练指标端口为 `9005`，本地回放端口为 `9004`。
+默认镜像 tag 为 `training-001`。Framework 为每个 Run 创建独立 Docker 网络和 `learner-local-train`、`aiserver-local-train` 目录，并仅在 Docker 标签和外部回执中保存 Task/Run 身份。训练指标使用 `9005` 且不启动回放；`9004` 只用于推理和模型评估。
 
 ## 测试
 
