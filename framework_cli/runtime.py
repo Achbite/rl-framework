@@ -17,6 +17,8 @@ from typing import Any
 
 from .spec import RunSpec
 
+EVALUATION_MODEL_FILE = "SaveModel.onnx"
+
 
 class RuntimeFailure(RuntimeError):
     pass
@@ -42,6 +44,26 @@ class DockerRuntime:
         run_key = hashlib.sha256(spec.run_id.encode("utf-8")).hexdigest()[:16]
         self.network = f"rl-training-{run_key}"
         self._events = self._load_events()
+
+    @staticmethod
+    def _resolve_evaluation_model(configured_path: str) -> tuple[Path, Path]:
+        candidate = Path(configured_path).expanduser().resolve()
+        savepoint = candidate if candidate.is_dir() else candidate.parent
+        model_path = (
+            savepoint / EVALUATION_MODEL_FILE
+            if candidate.is_dir()
+            else candidate
+        )
+        if model_path.name != EVALUATION_MODEL_FILE:
+            raise RuntimeFailure(
+                "model-evaluation requires a savepoint directory or "
+                f"{EVALUATION_MODEL_FILE}"
+            )
+        if not model_path.is_file():
+            raise RuntimeFailure(
+                f"evaluation model does not exist: {model_path}"
+            )
+        return savepoint, model_path
 
     def _load_events(self) -> list[dict[str, Any]]:
         timeline_path = self.run_root / "timeline.json"
@@ -127,11 +149,13 @@ class DockerRuntime:
             ["info", "--format", "{{json .ServerVersion}}"], timeout=20
         )
         model_path = None
+        model_savepoint = None
         if self.spec.mode == "model-evaluation":
-            candidate = Path(self.spec.model_path or "")
-            if not candidate.is_file():
-                raise RuntimeFailure(f"model file does not exist: {candidate}")
+            savepoint, candidate = self._resolve_evaluation_model(
+                self.spec.model_path or ""
+            )
             model_path = str(candidate)
+            model_savepoint = str(savepoint)
         initial_checkpoint = None
         if self.spec.initial_checkpoint:
             candidate = Path(self.spec.initial_checkpoint)
@@ -149,7 +173,7 @@ class DockerRuntime:
                 "available": inspect.returncode == 0,
             }
         required_roles = {
-            "inference-smoke": ("aiserver", "client"),
+            "local-test": ("aiserver", "client"),
             "training": ("learner", "aiserver", "client"),
             "model-evaluation": ("aiserver", "client"),
         }[self.spec.mode]
@@ -172,6 +196,7 @@ class DockerRuntime:
             "docker_server_version": json.loads(info.stdout.strip()),
             "images": images,
             "model_path": model_path,
+            "model_savepoint": model_savepoint,
             "initial_checkpoint": initial_checkpoint,
         }
 
@@ -324,6 +349,7 @@ class DockerRuntime:
         arguments: list[str],
     ) -> str:
         name = self._name(role)
+        component = self.spec.components[role]
         command = [
             "run",
             "--pull",
@@ -343,8 +369,12 @@ class DockerRuntime:
             f"rl-training.task_id={self.spec.task_id}",
             "--label",
             f"rl-training.run_id={self.spec.run_id}",
+            *component.docker_resource_args,
+            "--entrypoint",
+            component.command,
             *arguments,
             image_ref,
+            *component.args,
         ]
         result = self._docker(command, timeout=120)
         return result.stdout.strip()
@@ -374,6 +404,46 @@ class DockerRuntime:
             )
             detail = logs.stderr.strip() or logs.stdout.strip()
             raise RuntimeFailure(f"{role} exited before readiness: {detail}")
+
+    def _wait_healthy(self, role: str, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        last_status = "starting"
+        while time.monotonic() < deadline:
+            self._require_running(role)
+            result = self._docker(
+                [
+                    "inspect",
+                    "--format",
+                    "{{json .State.Health}}",
+                    self._name(role),
+                ],
+                check=False,
+            )
+            if result.returncode != 0:
+                time.sleep(0.2)
+                continue
+            raw = result.stdout.strip()
+            if raw in {"", "null", "<no value>"}:
+                raise RuntimeFailure(
+                    f"{role} image does not declare a Healthcheck"
+                )
+            health = json.loads(raw)
+            last_status = str(health.get("Status", "unknown"))
+            if last_status == "healthy":
+                return
+            if last_status == "unhealthy":
+                entries = health.get("Log") or []
+                detail = ""
+                if entries:
+                    detail = str(entries[-1].get("Output", "")).strip()
+                raise RuntimeFailure(
+                    f"{role} became unhealthy"
+                    + (f": {detail}" if detail else "")
+                )
+            time.sleep(0.5)
+        raise RuntimeFailure(
+            f"{role} health readiness timeout; status={last_status}"
+        )
 
     @staticmethod
     def _tcp_ready(port: int, timeout: float = 0.5) -> bool:
@@ -629,10 +699,8 @@ class DockerRuntime:
         identity_checksums: list[str] = []
         archive_manifests: dict[int, dict[str, Any]] = {}
         for version in (0, 2):
-            version_dir = archive / f"v{version:06d}"
-            manifest_path = (
-                version_dir / f"manifest_v{version:06d}.json"
-            )
+            version_dir = archive / f"{version:06d}"
+            manifest_path = version_dir / "manifest.json"
             if not manifest_path.is_file():
                 raise RuntimeFailure(
                     f"training archive is missing: {manifest_path}"
@@ -650,8 +718,10 @@ class DockerRuntime:
                 )
             checksum = hashlib.sha256(model_path.read_bytes()).hexdigest()
             if (
-                manifest.get("contract_version") != "0.5.0"
+                manifest.get("contract_version") != "0.6.0"
                 or manifest.get("model_version") != version
+                or manifest.get("model_file") != EVALUATION_MODEL_FILE
+                or manifest.get("checkpoint_file") != "checkpoint.pt"
                 or manifest.get("sha256") != checksum
                 or "run_id" in manifest
             ):
@@ -706,7 +776,7 @@ class DockerRuntime:
             )
             checksum = hashlib.sha256(model_path.read_bytes()).hexdigest()
             if (
-                manifest.get("contract_version") != "0.5.0"
+                manifest.get("contract_version") != "0.6.0"
                 or manifest.get("model_version") != version
                 or manifest.get("sha256") != checksum
                 or not checkpoint_path.is_file()
@@ -787,9 +857,9 @@ class DockerRuntime:
         self._record("preflight_complete")
         self._write_state("starting")
         required_ports = {
-            "inference-smoke": (9002, 9004),
-            "training": (9002, 9005, 9100, 9200),
-            "model-evaluation": (9002, 9004),
+            "local-test": (9004,),
+            "training": (9005,),
+            "model-evaluation": (9004,),
         }[self.spec.mode]
         try:
             self._assert_host_ports_available(required_ports)
@@ -826,17 +896,11 @@ class DockerRuntime:
             "--env",
             "MAZE_LEARNER_ID=learner-0",
             "--env",
-            "MAZE_WORKLOAD=training",
-            "--env",
-            "MAZE_SAMPLE_DISTRIBUTOR_HOST=maze-aiserver",
-            "--env",
             "MAZE_AISERVER_HOST=maze-aiserver",
             "--env",
             "MAZE_LOCAL_TRAIN_ROOT=/opt/rl/learner/models/local-train",
             "--publish",
             "127.0.0.1:9005:9005",
-            "--publish",
-            "127.0.0.1:9200:9200",
             "--volume",
             f"{learner_logs}:/opt/rl/learner/logs",
             "--volume",
@@ -871,9 +935,9 @@ class DockerRuntime:
             self.spec.image_ref("learner"),
             learner_arguments,
         )
-        self._ensure_host_port(9200, 180)
+        self._wait_healthy("learner", 180)
         self._ensure_host_port(9005, 180)
-        self._record("learner_services_ready")
+        self._record("learner_pod_ready")
 
         self._run_container(
             "aiserver",
@@ -881,17 +945,11 @@ class DockerRuntime:
             [
                 *self._base_env(),
                 "--env",
-                "MAZE_WORKLOAD=training",
-                "--env",
                 "MAZE_MODEL_DISTRIBUTOR_HOST=maze-learner",
                 "--env",
-                "MAZE_SAMPLE_DISTRIBUTOR_HOST=127.0.0.1",
+                "MAZE_SAMPLE_DISTRIBUTOR_HOST=maze-learner",
                 "--env",
                 "MAZE_LOCAL_TRAIN_ROOT=/opt/rl/aiserver/models/local-train",
-                "--publish",
-                "127.0.0.1:9002:9002",
-                "--publish",
-                "127.0.0.1:9100:9100",
                 "--volume",
                 f"{aiserver_logs}:/opt/rl/aiserver/log",
                 "--volume",
@@ -901,8 +959,7 @@ class DockerRuntime:
                 ),
             ],
         )
-        self._ensure_host_port(9100, 30)
-        self._ensure_host_port(9002, 60)
+        self._wait_healthy("aiserver", 60)
         self._record("model_v0_loaded_ack")
         self._record("aiserver_ready")
 
@@ -912,8 +969,6 @@ class DockerRuntime:
             [
                 *self._base_env(),
                 "--env",
-                "MAZE_WORKLOAD=training",
-                "--env",
                 "MAZE_AISERVER_HOST=maze-aiserver",
                 "--env",
                 f"MAZE_AGENT_NUM={self.spec.agents}",
@@ -921,8 +976,6 @@ class DockerRuntime:
                 f"MAZE_MAX_EPISODES={self.spec.episodes}",
                 "--env",
                 f"MAZE_MAX_STEPS={self.spec.max_steps}",
-                "--env",
-                "MAZE_VIZ_ENABLED=false",
                 "--volume",
                 f"{client_logs}:/opt/rl/maze-client/log",
             ],
@@ -992,9 +1045,11 @@ class DockerRuntime:
                 f"source=local-dev&run_id={urllib.parse.quote(self.spec.run_id)}"
             ),
             "ports": {
-                "aiserver": 9002,
                 "learner_metrics": 9005,
-                "sample_distributor": 9100,
+            },
+            "internal_ports": {
+                "aiserver": 9002,
+                "local_sample_service": 9100,
                 "model_distributor": 9200,
             },
         }
@@ -1007,25 +1062,24 @@ class DockerRuntime:
 
         aiserver_arguments = [
             *self._base_env(),
-            "--env",
-            f"MAZE_WORKLOAD={self.spec.mode}",
-            "--publish",
-            "127.0.0.1:9002:9002",
             "--volume",
             f"{aiserver_logs}:/opt/rl/aiserver/log",
         ]
         model_identity: dict[str, Any]
         if self.spec.mode == "model-evaluation":
-            model_path = Path(self.spec.model_path or "").resolve()
+            savepoint, model_path = self._resolve_evaluation_model(
+                self.spec.model_path or ""
+            )
             aiserver_arguments.extend(
                 [
                     "--volume",
-                    f"{model_path}:/opt/rl/aiserver/models/local/SaveModel.onnx:ro",
+                    f"{savepoint}:/opt/rl/aiserver/models/local:ro",
                 ]
             )
             model_identity = {
                 "source": "external",
                 "path": str(model_path),
+                "savepoint": str(savepoint),
                 "sha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
             }
         else:
@@ -1036,8 +1090,8 @@ class DockerRuntime:
             self.spec.image_ref("aiserver"),
             aiserver_arguments,
         )
-        self._ensure_host_port(9002, 60)
-        if self.spec.mode == "inference-smoke":
+        self._wait_healthy("aiserver", 60)
+        if self.spec.mode == "local-test":
             manifest_result = self._docker(
                 [
                     "exec",
@@ -1088,8 +1142,6 @@ class DockerRuntime:
             [
                 *self._base_env(),
                 "--env",
-                f"MAZE_WORKLOAD={self.spec.mode}",
-                "--env",
                 "MAZE_VALIDATION_RESULT_PATH=/opt/rl/maze-client/replays/client-result.json",
                 "--env",
                 "MAZE_AISERVER_HOST=maze-aiserver",
@@ -1099,8 +1151,6 @@ class DockerRuntime:
                 f"MAZE_MAX_EPISODES={self.spec.episodes}",
                 "--env",
                 f"MAZE_MAX_STEPS={self.spec.max_steps}",
-                "--env",
-                "MAZE_VIZ_ENABLED=true",
                 "--env",
                 "MAZE_VIZ_OUTPUT_DIR=/opt/rl/maze-client/replays",
                 "--publish",
@@ -1145,7 +1195,8 @@ class DockerRuntime:
             "client_result": result,
             "replay": status,
             "model": model_identity,
-            "ports": {"aiserver": 9002, "replay": 9004},
+            "ports": {"replay": 9004},
+            "internal_ports": {"aiserver": 9002},
         }
 
     def stop(self) -> dict[str, Any]:

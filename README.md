@@ -9,7 +9,7 @@
 运行推理通信与回放测试：
 
 ```bash
-./framework local-test --profile inference-smoke --json
+./framework local-test --profile local-test --json
 ```
 
 运行 4-Agent 本地训练闭环：
@@ -27,12 +27,13 @@
   --json
 ```
 
-使用指定 ONNX 模型运行本地验证：
+使用指定保存点运行本地验证。目录中模型文件名固定为
+`SaveModel.onnx`，AIServer 从自身配置的 `model.evaluation_dir` 读取：
 
 ```bash
 ./framework local-test \
   --profile model-evaluation \
-  --model-path /absolute/path/model.onnx \
+  --model-path /absolute/path/archive/000200 \
   --json
 ```
 
@@ -45,7 +46,9 @@
 ./framework stop --run-spec run-spec.json --json
 ```
 
-默认镜像 tag 为 `training-001`。Framework 为每个 Run 创建独立 Docker 网络和 `learner-local-train`、`aiserver-local-train` 目录，并仅在 Docker 标签和外部回执中保存 Task/Run 身份。训练指标使用 `9005` 且不启动回放；`9004` 只用于推理和模型评估。
+默认镜像 tag 为 `training-001`。RunSpec v2 分别保存三个角色的镜像仓库、tag、启动命令、参数与 CPU/内存/GPU 限制，并要求 AIServer 与 Client 同机部署。Framework 为每个 Run 创建独立 Docker 网络和组件目录，仅在 Docker 标签和外部回执中保存 Task/Run 身份。
+
+训练只向宿主映射指标端口 `9005`；`9002/9100/9200` 仅在任务网络内可见。推理和模型评估只映射回放端口 `9004`。
 
 ## 测试
 

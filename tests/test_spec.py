@@ -18,6 +18,7 @@ class RunSpecTest(unittest.TestCase):
 
     def baseline(self):
         return {
+            "schema_version": 2,
             "task_id": "m0-smoke-20260729-120000-0001",
             "run_id": "m0-smoke-20260729-120000-0001-run-0001",
             "attempt": 1,
@@ -25,10 +26,43 @@ class RunSpecTest(unittest.TestCase):
             "agents": 4,
             "episodes": 3,
             "max_steps": 256,
-            "images": {
-                "learner": "training-001",
-                "aiserver": "training-001",
-                "client": "training-001",
+            "components": {
+                "learner": {
+                    "image_repository": "rl-training/learner",
+                    "image_tag": "training-001",
+                    "command": "/opt/rl/learner/run.sh",
+                    "args": ["training"],
+                    "resources": {
+                        "cpus": 2,
+                        "memory_mb": 4096,
+                        "gpus": 0,
+                    },
+                },
+                "aiserver": {
+                    "image_repository": "rl-training/aiserver",
+                    "image_tag": "training-001",
+                    "command": "/opt/rl/aiserver/run.sh",
+                    "args": ["training"],
+                    "resources": {
+                        "cpus": 2,
+                        "memory_mb": 2048,
+                        "gpus": 0,
+                    },
+                },
+                "client": {
+                    "image_repository": "rl-training/maze-client",
+                    "image_tag": "training-001",
+                    "command": "/opt/rl/maze-client/run.sh",
+                    "args": [],
+                    "resources": {
+                        "cpus": 2,
+                        "memory_mb": 2048,
+                        "gpus": 0,
+                    },
+                },
+            },
+            "placement": {
+                "aiserver_client_same_host": "required",
             },
         }
 
@@ -60,7 +94,7 @@ class RunSpecTest(unittest.TestCase):
             str(Path("/tmp/checkpoint.pt").resolve()),
         )
 
-        document["mode"] = "inference-smoke"
+        document["mode"] = "local-test"
         with self.assertRaisesRegex(
             SpecError, "supported only for training"
         ):
@@ -74,9 +108,24 @@ class RunSpecTest(unittest.TestCase):
 
     def test_rejects_full_image_reference(self):
         document = self.baseline()
-        document["images"]["learner"] = "registry/repo:test-001"
+        document["components"]["learner"]["image_repository"] = (
+            "registry/repo:test-001"
+        )
         with self.assertRaises(SpecError):
             load_run_spec(str(self.write(document)))
+
+    def test_component_command_and_resources_are_preserved(self):
+        spec = load_run_spec(str(self.write(self.baseline())))
+        learner = spec.components["learner"]
+        self.assertEqual(
+            learner.command_argv,
+            ["/opt/rl/learner/run.sh", "training"],
+        )
+        self.assertEqual(
+            learner.docker_resource_args,
+            ["--cpus", "2", "--memory", "4096m"],
+        )
+        self.assertEqual(spec.server_pod_same_host, "required")
 
     def test_local_test_rejects_zero_override(self):
         repository = Path(__file__).resolve().parents[1]
@@ -88,7 +137,7 @@ class RunSpecTest(unittest.TestCase):
                     str(repository / "framework"),
                     "local-test",
                     "--profile",
-                    "inference-smoke",
+                    "local-test",
                     "--agents",
                     "0",
                     "--json",
@@ -105,6 +154,12 @@ class RunSpecTest(unittest.TestCase):
             json.loads(result.stdout)["error"],
             "agents, episodes, and max-steps must be positive",
         )
+
+    def test_legacy_inference_smoke_mode_reads_as_local_test(self):
+        document = self.baseline()
+        document["mode"] = "inference-smoke"
+        spec = load_run_spec(str(self.write(document)))
+        self.assertEqual(spec.mode, "local-test")
 
 
 if __name__ == "__main__":

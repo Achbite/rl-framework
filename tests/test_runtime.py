@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import tempfile
@@ -7,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from framework_cli.runtime import DockerRuntime
-from framework_cli.spec import RunSpec
+from framework_cli.spec import ComponentSpec, ResourceSpec, RunSpec
 
 
 class RuntimePortTransportTest(unittest.TestCase):
@@ -20,6 +21,7 @@ class RuntimePortTransportTest(unittest.TestCase):
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.spec = RunSpec(
+            schema_version=2,
             task_id="m0-test-20260729-120000-0001",
             run_id="m0-test-20260729-120000-0001-run-0001",
             attempt=1,
@@ -27,11 +29,30 @@ class RuntimePortTransportTest(unittest.TestCase):
             agents=4,
             episodes=3,
             max_steps=256,
-            image_tags={
-                "learner": "training-001",
-                "aiserver": "training-001",
-                "client": "training-001",
+            components={
+                "learner": ComponentSpec(
+                    "rl-training/learner",
+                    "training-001",
+                    "/opt/rl/learner/run.sh",
+                    ("training",),
+                    ResourceSpec(2.0, 4096, 0),
+                ),
+                "aiserver": ComponentSpec(
+                    "rl-training/aiserver",
+                    "training-001",
+                    "/opt/rl/aiserver/run.sh",
+                    ("training",),
+                    ResourceSpec(2.0, 2048, 0),
+                ),
+                "client": ComponentSpec(
+                    "rl-training/maze-client",
+                    "training-001",
+                    "/opt/rl/maze-client/run.sh",
+                    (),
+                    ResourceSpec(2.0, 2048, 0),
+                ),
             },
+            server_pod_same_host="required",
             model_path=None,
             initial_checkpoint=None,
             source_path=Path(self.workspace.name) / "run.json",
@@ -44,6 +65,117 @@ class RuntimePortTransportTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertEqual(DockerRuntime._ssh_target(path), "lima-colima")
+
+    def test_evaluation_model_resolves_fixed_savepoint_layout(self):
+        savepoint = Path(self.workspace.name) / "archive" / "000200"
+        savepoint.mkdir(parents=True)
+        model = savepoint / "SaveModel.onnx"
+        model.write_bytes(b"onnx")
+
+        resolved_dir, resolved_model = (
+            DockerRuntime._resolve_evaluation_model(str(savepoint))
+        )
+        self.assertEqual(resolved_dir, savepoint.resolve())
+        self.assertEqual(resolved_model, model.resolve())
+
+        direct_dir, direct_model = (
+            DockerRuntime._resolve_evaluation_model(str(model))
+        )
+        self.assertEqual(direct_dir, savepoint.resolve())
+        self.assertEqual(direct_model, model.resolve())
+
+        wrong_name = savepoint / "model_v000200.onnx"
+        wrong_name.write_bytes(b"onnx")
+        with self.assertRaisesRegex(Exception, "SaveModel.onnx"):
+            DockerRuntime._resolve_evaluation_model(str(wrong_name))
+
+    def test_training_artifacts_use_fixed_savepoint_layout(self):
+        local_train = Path(self.workspace.name) / "learner-local-train"
+        archive = local_train / "archive"
+        serving = local_train / "runtime" / "serving"
+        checkpoints = local_train / "runtime" / "checkpoints"
+        receipts = local_train / "runtime" / "receipts"
+        for directory in (archive, serving, checkpoints, receipts):
+            directory.mkdir(parents=True)
+
+        archive_checksums = {}
+        for version in (0, 2):
+            savepoint = archive / f"{version:06d}"
+            savepoint.mkdir()
+            model = savepoint / "SaveModel.onnx"
+            model.write_bytes(f"archive-model-{version}".encode())
+            (savepoint / "checkpoint.pt").write_bytes(b"checkpoint")
+            checksum = hashlib.sha256(model.read_bytes()).hexdigest()
+            archive_checksums[version] = checksum
+            (savepoint / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "contract_version": "0.6.0",
+                        "model_version": version,
+                        "model_file": "SaveModel.onnx",
+                        "checkpoint_file": "checkpoint.pt",
+                        "sha256": checksum,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        receipt_checksums = {
+            1: hashlib.sha256(b"receipt-model-1").hexdigest(),
+            2: archive_checksums[2],
+        }
+        for version in (1, 2):
+            (receipts / f"update-{version}.json").write_text(
+                json.dumps(
+                    {
+                        "state": "ACKED",
+                        "target_model_version": version,
+                        "behavior_model_version": version - 1,
+                        "train_update_id": f"update-{version}",
+                        "archive_committed": version == 2,
+                        "manifest": {
+                            "sha256": receipt_checksums[version],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        for version in (1, 2):
+            model = serving / f"model_v{version:06d}.onnx"
+            model.write_bytes(f"serving-model-{version}".encode())
+            checksum = hashlib.sha256(model.read_bytes()).hexdigest()
+            (serving / f"manifest_v{version:06d}.json").write_text(
+                json.dumps(
+                    {
+                        "contract_version": "0.6.0",
+                        "model_version": version,
+                        "sha256": checksum,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (checkpoints / f"checkpoint_v{version:06d}.pt").write_bytes(
+                b"checkpoint"
+            )
+
+        runtime = DockerRuntime(self.spec)
+        checkpoint_probe = mock.Mock(
+            stdout=json.dumps(
+                {
+                    "version": 2,
+                    "optimizer": True,
+                    "update": "update-2",
+                }
+            )
+        )
+        with mock.patch.object(
+            runtime, "_docker", return_value=checkpoint_probe
+        ):
+            result = runtime._validate_training_artifacts(local_train, 2)
+
+        self.assertEqual(result["archived_versions"], [0, 2])
+        self.assertEqual(result["runtime_versions"], [1, 2])
 
     def test_tunnel_socket_is_short_and_stable(self):
         runtime = DockerRuntime(self.spec)
@@ -110,6 +242,53 @@ class RuntimePortTransportTest(unittest.TestCase):
         environment = runtime._base_env()
         self.assertNotIn("MAZE_RUN_ID", " ".join(environment))
         self.assertNotIn(self.spec.run_id, " ".join(environment))
+
+    def test_container_uses_runspec_image_command_and_resources(self):
+        runtime = DockerRuntime(self.spec)
+        completed = mock.Mock(stdout="container-id\n")
+        with mock.patch.object(
+            runtime, "_docker", return_value=completed
+        ) as docker:
+            container_id = runtime._run_container(
+                "learner",
+                self.spec.image_ref("learner"),
+                ["--env", "EXAMPLE=1"],
+            )
+        self.assertEqual(container_id, "container-id")
+        arguments = docker.call_args.args[0]
+        image_index = arguments.index("rl-training/learner:training-001")
+        self.assertEqual(
+            arguments[image_index + 1 :],
+            ["training"],
+        )
+        entrypoint_index = arguments.index("--entrypoint")
+        self.assertEqual(
+            arguments[entrypoint_index + 1],
+            "/opt/rl/learner/run.sh",
+        )
+        self.assertIn("--cpus", arguments)
+        self.assertIn("4096m", arguments)
+
+    def test_healthcheck_is_required_and_waited(self):
+        runtime = DockerRuntime(self.spec)
+        healthy = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({"Status": "healthy"}),
+            stderr="",
+        )
+        with (
+            mock.patch.object(runtime, "_require_running"),
+            mock.patch.object(runtime, "_docker", return_value=healthy),
+        ):
+            runtime._wait_healthy("learner", 1)
+
+        missing = mock.Mock(returncode=0, stdout="null\n", stderr="")
+        with (
+            mock.patch.object(runtime, "_require_running"),
+            mock.patch.object(runtime, "_docker", return_value=missing),
+        ):
+            with self.assertRaisesRegex(Exception, "does not declare"):
+                runtime._wait_healthy("learner", 1)
 
     def test_runs_have_distinct_networks_and_storage_roots(self):
         first = DockerRuntime(self.spec)
@@ -198,6 +377,78 @@ class RuntimePortTransportTest(unittest.TestCase):
                 ("stop", "aiserver-id", 5),
                 ("stop", "learner-id", 5),
             ],
+        )
+
+    def test_training_exposes_only_metrics_and_uses_internal_data_plane(self):
+        runtime = DockerRuntime(self.spec, runtime_scope="local-tests")
+        started = {}
+
+        def record_container(role, image_ref, arguments):
+            started[role] = {
+                "image_ref": image_ref,
+                "arguments": arguments,
+            }
+            return f"{role}-id"
+
+        metrics = {
+            "actor": {
+                "produced": 3072,
+                "outbound_pending": 0,
+                "final_drop": 0,
+                "model_version": 1,
+            },
+            "distributor": {
+                "accepted": 3072,
+                "acked": 3072,
+                "ready_samples": 0,
+                "leased_samples": 0,
+            },
+            "learner": {
+                "model_version": 2,
+                "train_updates": 2,
+                "trained_samples": 3072,
+            },
+        }
+        with (
+            mock.patch.object(
+                runtime, "_run_container", side_effect=record_container
+            ),
+            mock.patch.object(runtime, "_wait_healthy"),
+            mock.patch.object(runtime, "_ensure_host_port"),
+            mock.patch.object(runtime, "_wait_container_exit", return_value=0),
+            mock.patch.object(runtime, "_wait_metrics", return_value=metrics),
+            mock.patch.object(
+                runtime,
+                "_validate_training_artifacts",
+                return_value={"current_version": 2},
+            ),
+            mock.patch.object(
+                runtime,
+                "_docker",
+                return_value=mock.Mock(
+                    returncode=0, stdout="{}", stderr=""
+                ),
+            ),
+        ):
+            result = runtime._start_training()
+
+        learner_args = " ".join(started["learner"]["arguments"])
+        aiserver_args = " ".join(started["aiserver"]["arguments"])
+        client_args = " ".join(started["client"]["arguments"])
+        self.assertIn("127.0.0.1:9005:9005", learner_args)
+        self.assertNotIn("127.0.0.1:9200:9200", learner_args)
+        self.assertIn(
+            "MAZE_SAMPLE_DISTRIBUTOR_HOST=maze-learner",
+            aiserver_args,
+        )
+        self.assertNotIn("--publish", started["aiserver"]["arguments"])
+        self.assertNotIn("MAZE_WORKLOAD", client_args)
+        self.assertNotIn("9004", client_args)
+        self.assertEqual(
+            result["ports"], {"learner_metrics": 9005}
+        )
+        self.assertEqual(
+            result["internal_ports"]["local_sample_service"], 9100
         )
 
     def test_required_quiesce_failure_is_reported_after_cleanup(self):

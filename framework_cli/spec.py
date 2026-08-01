@@ -9,15 +9,16 @@ from typing import Any
 
 TAG_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$")
-IMAGE_NAMES = {
-    "learner": "rl-training/learner",
-    "aiserver": "rl-training/aiserver",
-    "client": "rl-training/maze-client",
-}
+REPOSITORY_PATTERN = re.compile(
+    r"^[a-z0-9][a-z0-9._-]*(?::[0-9]+)?"
+    r"(?:/[a-z0-9][a-z0-9._-]*)+$"
+)
+ROLE_NAMES = ("learner", "aiserver", "client")
 MODE_ALIASES = {
+    "inference-smoke": "local-test",
     "local-model-validation": "model-evaluation",
 }
-MODES = {"inference-smoke", "training", "model-evaluation"}
+MODES = {"local-test", "training", "model-evaluation"}
 
 
 class SpecError(ValueError):
@@ -25,7 +26,44 @@ class SpecError(ValueError):
 
 
 @dataclass(frozen=True)
+class ResourceSpec:
+    cpus: float
+    memory_mb: int
+    gpus: int
+
+
+@dataclass(frozen=True)
+class ComponentSpec:
+    image_repository: str
+    image_tag: str
+    command: str
+    args: tuple[str, ...]
+    resources: ResourceSpec
+
+    @property
+    def image_ref(self) -> str:
+        return f"{self.image_repository}:{self.image_tag}"
+
+    @property
+    def command_argv(self) -> list[str]:
+        return [self.command, *self.args]
+
+    @property
+    def docker_resource_args(self) -> list[str]:
+        arguments = [
+            "--cpus",
+            f"{self.resources.cpus:g}",
+            "--memory",
+            f"{self.resources.memory_mb}m",
+        ]
+        if self.resources.gpus > 0:
+            arguments.extend(["--gpus", str(self.resources.gpus)])
+        return arguments
+
+
+@dataclass(frozen=True)
 class RunSpec:
+    schema_version: int
     task_id: str
     run_id: str
     attempt: int
@@ -33,7 +71,8 @@ class RunSpec:
     agents: int
     episodes: int
     max_steps: int
-    image_tags: dict[str, str]
+    components: dict[str, ComponentSpec]
+    server_pod_same_host: str
     model_path: str | None
     initial_checkpoint: str | None
     source_path: Path
@@ -43,7 +82,7 @@ class RunSpec:
         return self.agents * self.episodes * self.max_steps
 
     def image_ref(self, role: str) -> str:
-        return f"{IMAGE_NAMES[role]}:{self.image_tags[role]}"
+        return self.components[role].image_ref
 
 
 def _positive_int(document: dict[str, Any], field: str) -> int:
@@ -51,6 +90,69 @@ def _positive_int(document: dict[str, Any], field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise SpecError(f"{field} must be a positive integer")
     return value
+
+
+def _load_resources(role: str, document: Any) -> ResourceSpec:
+    if not isinstance(document, dict):
+        raise SpecError(f"components.{role}.resources must be an object")
+    cpus = document.get("cpus")
+    memory_mb = document.get("memory_mb")
+    gpus = document.get("gpus")
+    if (
+        not isinstance(cpus, (int, float))
+        or isinstance(cpus, bool)
+        or cpus <= 0
+    ):
+        raise SpecError(f"components.{role}.resources.cpus must be positive")
+    if (
+        not isinstance(memory_mb, int)
+        or isinstance(memory_mb, bool)
+        or memory_mb <= 0
+    ):
+        raise SpecError(
+            f"components.{role}.resources.memory_mb must be positive"
+        )
+    if (
+        not isinstance(gpus, int)
+        or isinstance(gpus, bool)
+        or gpus < 0
+    ):
+        raise SpecError(
+            f"components.{role}.resources.gpus must be non-negative"
+        )
+    return ResourceSpec(float(cpus), memory_mb, gpus)
+
+
+def _load_component(role: str, document: Any) -> ComponentSpec:
+    if not isinstance(document, dict):
+        raise SpecError(f"components.{role} must be an object")
+    repository = document.get("image_repository")
+    tag = document.get("image_tag")
+    command = document.get("command")
+    args = document.get("args")
+    if (
+        not isinstance(repository, str)
+        or not REPOSITORY_PATTERN.fullmatch(repository)
+    ):
+        raise SpecError(
+            f"components.{role}.image_repository has an invalid format"
+        )
+    if not isinstance(tag, str) or not TAG_PATTERN.fullmatch(tag):
+        raise SpecError(f"components.{role}.image_tag must be a Docker tag")
+    if not isinstance(command, str) or not command or "\x00" in command:
+        raise SpecError(f"components.{role}.command must be a string")
+    if (
+        not isinstance(args, list)
+        or any(not isinstance(item, str) or "\x00" in item for item in args)
+    ):
+        raise SpecError(f"components.{role}.args must be a string array")
+    return ComponentSpec(
+        image_repository=repository,
+        image_tag=tag,
+        command=command,
+        args=tuple(args),
+        resources=_load_resources(role, document.get("resources")),
+    )
 
 
 def load_run_spec(path: str) -> RunSpec:
@@ -62,6 +164,8 @@ def load_run_spec(path: str) -> RunSpec:
 
     if not isinstance(document, dict):
         raise SpecError("run spec must be a JSON object")
+    if document.get("schema_version") != 2:
+        raise SpecError("run spec schema_version must be 2")
 
     task_id = document.get("task_id")
     run_id = document.get("run_id")
@@ -74,18 +178,25 @@ def load_run_spec(path: str) -> RunSpec:
         mode = MODE_ALIASES[mode]
     if mode not in MODES:
         raise SpecError(
-            "mode must be inference-smoke, training, or model-evaluation"
+            "mode must be local-test, training, or model-evaluation"
         )
 
-    images = document.get("images")
-    if not isinstance(images, dict):
-        raise SpecError("images must be an object")
-    image_tags: dict[str, str] = {}
-    for role in ("learner", "aiserver", "client"):
-        tag = images.get(role)
-        if not isinstance(tag, str) or not TAG_PATTERN.fullmatch(tag):
-            raise SpecError(f"images.{role} must be a Docker tag")
-        image_tags[role] = tag
+    components_document = document.get("components")
+    if not isinstance(components_document, dict):
+        raise SpecError("components must be an object")
+    components = {
+        role: _load_component(role, components_document.get(role))
+        for role in ROLE_NAMES
+    }
+
+    placement = document.get("placement")
+    if not isinstance(placement, dict):
+        raise SpecError("placement must be an object")
+    server_pod_same_host = placement.get("aiserver_client_same_host")
+    if server_pod_same_host != "required":
+        raise SpecError(
+            "placement.aiserver_client_same_host must be required"
+        )
 
     attempt = _positive_int(document, "attempt")
     agents = _positive_int(document, "agents")
@@ -124,6 +235,7 @@ def load_run_spec(path: str) -> RunSpec:
         )
 
     return RunSpec(
+        schema_version=2,
         task_id=task_id,
         run_id=run_id,
         attempt=attempt,
@@ -131,7 +243,8 @@ def load_run_spec(path: str) -> RunSpec:
         agents=agents,
         episodes=episodes,
         max_steps=max_steps,
-        image_tags=image_tags,
+        components=components,
+        server_pod_same_host=server_pod_same_host,
         model_path=model_path,
         initial_checkpoint=initial_checkpoint,
         source_path=source,

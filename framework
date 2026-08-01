@@ -30,15 +30,51 @@ def build_parser() -> argparse.ArgumentParser:
     local.add_argument(
         "--profile",
         required=True,
-        choices=("inference-smoke", "training", "model-evaluation"),
+        choices=("local-test", "training", "model-evaluation"),
     )
     local.add_argument("--learner-image-tag", default="training-001")
     local.add_argument("--aiserver-image-tag", default="training-001")
     local.add_argument("--client-image-tag", default="training-001")
+    local.add_argument(
+        "--learner-image-repository", default="rl-training/learner"
+    )
+    local.add_argument(
+        "--aiserver-image-repository", default="rl-training/aiserver"
+    )
+    local.add_argument(
+        "--client-image-repository", default="rl-training/maze-client"
+    )
+    local.add_argument(
+        "--learner-command", default="/opt/rl/learner/run.sh"
+    )
+    local.add_argument(
+        "--aiserver-command", default="/opt/rl/aiserver/run.sh"
+    )
+    local.add_argument(
+        "--client-command", default="/opt/rl/maze-client/run.sh"
+    )
+    local.add_argument("--learner-arg", action="append")
+    local.add_argument("--aiserver-arg", action="append")
+    local.add_argument("--client-arg", action="append")
+    local.add_argument("--learner-cpus", type=float, default=2.0)
+    local.add_argument("--aiserver-cpus", type=float, default=2.0)
+    local.add_argument("--client-cpus", type=float, default=2.0)
+    local.add_argument("--learner-memory-mb", type=int, default=4096)
+    local.add_argument("--aiserver-memory-mb", type=int, default=2048)
+    local.add_argument("--client-memory-mb", type=int, default=2048)
+    local.add_argument("--learner-gpus", type=int, default=0)
+    local.add_argument("--aiserver-gpus", type=int, default=0)
+    local.add_argument("--client-gpus", type=int, default=0)
     local.add_argument("--agents", type=int)
     local.add_argument("--episodes", type=int)
     local.add_argument("--max-steps", type=int)
-    local.add_argument("--model-path")
+    local.add_argument(
+        "--model-path",
+        help=(
+            "model-evaluation savepoint directory or its "
+            "SaveModel.onnx file"
+        ),
+    )
     local.add_argument("--initial-checkpoint")
     local.add_argument("--keep-running", action="store_true")
     add_output_option(local)
@@ -47,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def local_test_spec(args: argparse.Namespace) -> Path:
     defaults = {
-        "inference-smoke": (1, 1, 4),
+        "local-test": (1, 1, 4),
         "training": (4, 3, 256),
         "model-evaluation": (1, 1, 4),
     }
@@ -70,7 +106,33 @@ def local_test_spec(args: argparse.Namespace) -> Path:
     suffix = f"{secrets.randbelow(10000):04d}"
     task_id = f"local-{args.profile}-{timestamp}-{suffix}"
     run_id = f"{task_id}-run-0001"
+    default_component_args = {
+        "learner": ["training"],
+        "aiserver": [args.profile],
+        "client": [],
+    }
+    components = {}
+    for role in ("learner", "aiserver", "client"):
+        explicit_args = getattr(args, f"{role}_arg")
+        components[role] = {
+            "image_repository": getattr(
+                args, f"{role}_image_repository"
+            ),
+            "image_tag": getattr(args, f"{role}_image_tag"),
+            "command": getattr(args, f"{role}_command"),
+            "args": (
+                default_component_args[role]
+                if explicit_args is None
+                else explicit_args
+            ),
+            "resources": {
+                "cpus": getattr(args, f"{role}_cpus"),
+                "memory_mb": getattr(args, f"{role}_memory_mb"),
+                "gpus": getattr(args, f"{role}_gpus"),
+            },
+        }
     document = {
+        "schema_version": 2,
         "task_id": task_id,
         "run_id": run_id,
         "attempt": 1,
@@ -78,10 +140,9 @@ def local_test_spec(args: argparse.Namespace) -> Path:
         "agents": agents,
         "episodes": episodes,
         "max_steps": max_steps,
-        "images": {
-            "learner": args.learner_image_tag,
-            "aiserver": args.aiserver_image_tag,
-            "client": args.client_image_tag,
+        "components": components,
+        "placement": {
+            "aiserver_client_same_host": "required",
         },
     }
     if args.model_path:

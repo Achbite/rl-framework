@@ -9,7 +9,7 @@ Starts and checks the local Learner, AIServer, and Maze Client as one workflow. 
 Run the inference communication and replay smoke test:
 
 ```bash
-./framework local-test --profile inference-smoke --json
+./framework local-test --profile local-test --json
 ```
 
 Run the local four-agent training loop:
@@ -27,12 +27,14 @@ Components clear their own `local-train` directories and start from zero by defa
   --json
 ```
 
-Evaluate an explicit ONNX model locally:
+Evaluate an explicit savepoint locally. The model filename inside the directory
+is fixed as `SaveModel.onnx`; AIServer reads it from its configured
+`model.evaluation_dir`:
 
 ```bash
 ./framework local-test \
   --profile model-evaluation \
-  --model-path /absolute/path/model.onnx \
+  --model-path /absolute/path/archive/000200 \
   --json
 ```
 
@@ -45,7 +47,9 @@ Use an existing RunSpec:
 ./framework stop --run-spec run-spec.json --json
 ```
 
-The default image tag is `training-001`. Framework creates a dedicated Docker network plus `learner-local-train` and `aiserver-local-train` directories for every Run. Task and Run identity remain in Docker labels and external receipts only. Training metrics use `9005` without replay; `9004` is reserved for inference and model evaluation.
+The default image tag is `training-001`. RunSpec v2 stores each role's image repository, tag, command, arguments, and CPU/memory/GPU limits, and requires AIServer and Client to share a host. Framework creates a dedicated Docker network and component directories for every Run. Task and Run identity remain in Docker labels and external receipts only.
+
+Training exposes only metrics port `9005` to the host; `9002/9100/9200` remain internal to the task network. Inference and model evaluation expose only replay port `9004`.
 
 ## Tests
 
