@@ -7,7 +7,12 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from framework_cli.runtime import DockerRuntime
+from framework_cli.runtime import (
+    DockerRuntime,
+    learner_monitor_transport_readiness,
+    training_completion_status,
+    training_record_readiness,
+)
 from framework_cli.spec import ComponentSpec, ResourceSpec, RunSpec
 
 
@@ -88,6 +93,169 @@ class RuntimePortTransportTest(unittest.TestCase):
         wrong_name.write_bytes(b"onnx")
         with self.assertRaisesRegex(Exception, "SaveModel.onnx"):
             DockerRuntime._resolve_evaluation_model(str(wrong_name))
+
+    def test_learner_monitor_transport_requires_same_current_instance(self):
+        status = {
+            "schema_version": 1,
+            "service": "learner-metrics",
+            "stream": "current",
+            "service_instance_id": "learner-metrics-a",
+            "metrics_source_id": "local-training-a",
+            "started_at": 100.0,
+            "metrics_dir": "/opt/rl/learner/models/local-train/metrics",
+            "mode": "training",
+            "latest_sequence": 4,
+            "latest_timestamp": 101.0,
+            "stale": False,
+        }
+
+        readiness = learner_monitor_transport_readiness(
+            status,
+            dict(status),
+            minimum_timestamp=99.0,
+            now=102.0,
+        )
+        self.assertTrue(readiness["ready"], readiness["reasons"])
+
+        wrong_service = dict(status)
+        wrong_service["service"] = "archive-metrics"
+        mismatch = learner_monitor_transport_readiness(
+            wrong_service,
+            dict(status),
+            minimum_timestamp=99.0,
+            now=102.0,
+        )
+        self.assertIn("host_service_mismatch", mismatch["reasons"])
+
+        wrong_instance = dict(status)
+        wrong_instance["service_instance_id"] = "learner-metrics-b"
+        mismatch = learner_monitor_transport_readiness(
+            status,
+            wrong_instance,
+            minimum_timestamp=99.0,
+            now=102.0,
+        )
+        self.assertIn(
+            "monitor_service_instance_id_mismatch", mismatch["reasons"]
+        )
+
+        stale = dict(status)
+        stale["stale"] = True
+        mismatch = learner_monitor_transport_readiness(
+            stale,
+            dict(status),
+            minimum_timestamp=99.0,
+            now=102.0,
+        )
+        self.assertIn("host_metrics_stale", mismatch["reasons"])
+
+        wrong_directory = dict(status)
+        wrong_directory["metrics_dir"] = "/opt/rl/archive/metrics"
+        mismatch = learner_monitor_transport_readiness(
+            wrong_directory,
+            dict(status),
+            minimum_timestamp=99.0,
+            now=102.0,
+        )
+        self.assertIn("host_metrics_dir_mismatch", mismatch["reasons"])
+
+        old_archive = dict(status)
+        old_archive["started_at"] = 90.0
+        old_archive["latest_timestamp"] = 91.0
+        mismatch = learner_monitor_transport_readiness(
+            old_archive,
+            dict(old_archive),
+            minimum_timestamp=99.0,
+            now=102.0,
+        )
+        self.assertIn("host_service_predates_launch", mismatch["reasons"])
+        self.assertIn(
+            "container_service_predates_launch", mismatch["reasons"]
+        )
+
+        missing = learner_monitor_transport_readiness(
+            {}, {}, minimum_timestamp=99.0, now=102.0
+        )
+        self.assertIn("host_status_missing", missing["reasons"])
+        self.assertIn("container_status_missing", missing["reasons"])
+
+    def test_learner_monitor_transport_is_recorded_after_verification(self):
+        runtime = DockerRuntime(self.spec)
+        with (
+            mock.patch.object(runtime, "_tcp_ready", return_value=True),
+            mock.patch.object(runtime, "_record_port_transport") as record,
+        ):
+            transport = runtime._ensure_host_port(
+                9005, 1, record_transport=False
+            )
+
+        self.assertEqual(transport, "docker-publish")
+        record.assert_not_called()
+
+    def test_training_readiness_requires_fresh_consistent_training_identity(self):
+        record = {
+            "mode": "training",
+            "timestamp": 100.0,
+            "interval_ms": 1000,
+            "actor": {
+                "ready": True,
+                "instance_id": "actor-1",
+                "workload_mode": "WORKLOAD_MODE_TRAINING",
+                "model_version": 1,
+                "model_checksum": "a" * 64,
+                "expected_model_checksum": "a" * 64,
+            },
+            "distributor": {
+                "ready": True,
+                "ingress_ready": True,
+                "pool_ready": True,
+                "instance_id": "pool-1",
+            },
+            "learner": {"model_version": 2, "error": ""},
+            "model": {
+                "ready": True,
+                "latest_version": 2,
+                "latest_checksum": "b" * 64,
+                "expected_latest_checksum": "b" * 64,
+                "latest_ack_version": 1,
+                "latest_ack_status": "MODEL_LOAD_STATUS_LOADED",
+            },
+            "chain": {"ready": True},
+        }
+
+        readiness = training_record_readiness(
+            record, minimum_timestamp=99.0, now=101.0
+        )
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(readiness["model_lag"], 1)
+
+        record["actor"]["workload_mode"] = (
+            "WORKLOAD_MODE_MODEL_EVALUATION"
+        )
+        mismatch = training_record_readiness(
+            record, minimum_timestamp=99.0, now=101.0
+        )
+        self.assertIn("actor_workload_mismatch", mismatch["reasons"])
+
+        record["actor"]["workload_mode"] = "WORKLOAD_MODE_TRAINING"
+        stale = training_record_readiness(
+            record, minimum_timestamp=101.0, now=110.0
+        )
+        self.assertIn("metrics_predate_launch", stale["reasons"])
+        self.assertIn("metrics_stale", stale["reasons"])
+
+        container_record = json.loads(json.dumps(record))
+        container_record["actor"]["instance_id"] = "actor-other"
+        source_mismatch = training_record_readiness(
+            record,
+            minimum_timestamp=99.0,
+            now=101.0,
+            container_record=container_record,
+        )
+        self.assertIn(
+            "container_actor_identity_mismatch",
+            source_mismatch["reasons"],
+        )
 
     def test_training_artifacts_use_fixed_savepoint_layout(self):
         local_train = Path(self.workspace.name) / "learner-local-train"
@@ -402,11 +570,19 @@ class RuntimePortTransportTest(unittest.TestCase):
                 "acked": 3072,
                 "ready_samples": 0,
                 "leased_samples": 0,
+                "trained": 3072,
+                "stale": 0,
+                "invalid": 0,
+                "shutdown_untrained": 0,
             },
             "learner": {
-                "model_version": 2,
-                "train_updates": 2,
+                "model_version": 6,
+                "initial_model_version": 0,
+                "train_updates": 6,
                 "trained_samples": 3072,
+                "run_train_updates": 6,
+                "run_trained_samples": 3072,
+                "train_batch_size": 512,
             },
         }
         with (
@@ -414,13 +590,27 @@ class RuntimePortTransportTest(unittest.TestCase):
                 runtime, "_run_container", side_effect=record_container
             ),
             mock.patch.object(runtime, "_wait_healthy"),
-            mock.patch.object(runtime, "_ensure_host_port"),
+            mock.patch.object(
+                runtime,
+                "_ensure_host_port",
+                return_value="docker-publish",
+            ),
+            mock.patch.object(
+                runtime,
+                "_wait_learner_monitor_transport",
+                return_value={"ready": True, "reasons": []},
+            ),
+            mock.patch.object(
+                runtime,
+                "_wait_training_ready",
+                return_value=(metrics, {"ready": True, "reasons": []}),
+            ),
             mock.patch.object(runtime, "_wait_container_exit", return_value=0),
             mock.patch.object(runtime, "_wait_metrics", return_value=metrics),
             mock.patch.object(
                 runtime,
                 "_validate_training_artifacts",
-                return_value={"current_version": 2},
+                return_value={"current_version": 6},
             ),
             mock.patch.object(
                 runtime,
@@ -430,7 +620,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                 ),
             ),
         ):
-            result = runtime._start_training()
+            result = runtime._start_training(wait_for_completion=True)
 
         learner_args = " ".join(started["learner"]["arguments"])
         aiserver_args = " ".join(started["aiserver"]["arguments"])
@@ -449,6 +639,193 @@ class RuntimePortTransportTest(unittest.TestCase):
         )
         self.assertEqual(
             result["internal_ports"]["local_sample_service"], 9100
+        )
+        self.assertEqual(
+            result["monitor_url"], "http://127.0.0.1:9005/"
+        )
+
+    def test_completion_requires_trained_disposition_not_only_ack(self):
+        record = {
+            "actor": {
+                "produced": 3072,
+                "outbound_pending": 0,
+                "final_drop": 0,
+            },
+            "distributor": {
+                "accepted": 3072,
+                "acked": 3072,
+                "ready_samples": 0,
+                "leased_samples": 0,
+                "trained": 1024,
+                "stale": 2048,
+                "invalid": 0,
+                "shutdown_untrained": 0,
+            },
+            "learner": {
+                "model_version": 2,
+                "initial_model_version": 0,
+                "run_train_updates": 2,
+                "run_trained_samples": 1024,
+                "train_batch_size": 512,
+            },
+        }
+
+        completion = training_completion_status(record, 3072)
+
+        self.assertFalse(completion["complete"])
+        self.assertTrue(completion["failed"])
+        self.assertIn(
+            "non_trained_disposition_stale", completion["reasons"]
+        )
+
+    def test_completion_uses_run_scoped_resume_counters(self):
+        record = {
+            "actor": {
+                "produced": 3072,
+                "outbound_pending": 0,
+                "final_drop": 0,
+            },
+            "distributor": {
+                "accepted": 3072,
+                "acked": 3072,
+                "ready_samples": 0,
+                "leased_samples": 0,
+                "trained": 3072,
+                "stale": 0,
+                "invalid": 0,
+                "shutdown_untrained": 0,
+            },
+            "learner": {
+                "model_version": 26,
+                "initial_model_version": 20,
+                "train_updates": 26,
+                "trained_samples": 13072,
+                "run_train_updates": 6,
+                "run_trained_samples": 3072,
+                "train_batch_size": 512,
+            },
+        }
+
+        completion = training_completion_status(record, 3072)
+
+        self.assertTrue(completion["complete"], completion["reasons"])
+
+    def test_platform_training_start_returns_after_chain_readiness(self):
+        runtime = DockerRuntime(self.spec)
+        record = {
+            "actor": {"produced": 1, "final_drop": 0},
+            "distributor": {"accepted": 1, "acked": 0},
+            "learner": {"model_version": 0, "train_updates": 0},
+        }
+        with (
+            mock.patch.object(runtime, "_run_container"),
+            mock.patch.object(runtime, "_wait_healthy"),
+            mock.patch.object(
+                runtime,
+                "_ensure_host_port",
+                return_value="docker-publish",
+            ),
+            mock.patch.object(
+                runtime,
+                "_wait_learner_monitor_transport",
+                return_value={"ready": True, "reasons": []},
+            ),
+            mock.patch.object(
+                runtime,
+                "_wait_training_ready",
+                return_value=(
+                    record,
+                    {"ready": True, "reasons": [], "model_lag": 0},
+                ),
+            ),
+            mock.patch.object(
+                runtime,
+                "_container_state",
+                return_value={"exists": True, "running": True},
+            ),
+            mock.patch.object(runtime, "_wait_container_exit") as wait_exit,
+            mock.patch.object(
+                runtime, "_validate_training_artifacts"
+            ) as validate_artifacts,
+        ):
+            result = runtime._start_training()
+
+        self.assertEqual(result["actual_status"], "ready")
+        self.assertEqual(result["phase"], "running")
+        self.assertEqual(result["counts"]["produced"], 1)
+        wait_exit.assert_not_called()
+        validate_artifacts.assert_not_called()
+
+    def test_status_degrades_when_live_chain_identity_does_not_match(self):
+        runtime = DockerRuntime(self.spec)
+        checksum = "a" * 64
+        timestamp = 100.0
+        runtime._write_state(
+            "ready",
+            result={"readiness": {"timestamp": timestamp}},
+        )
+        record = {
+            "mode": "training",
+            "timestamp": timestamp,
+            "interval_ms": 1000,
+            "actor": {
+                "ready": True,
+                "instance_id": "actor-status",
+                "workload_mode": "WORKLOAD_MODE_TRAINING",
+                "model_version": 0,
+                "model_checksum": checksum,
+                "expected_model_checksum": checksum,
+            },
+            "distributor": {
+                "ready": True,
+                "instance_id": "pool-status",
+                "ingress_ready": True,
+                "pool_ready": True,
+            },
+            "learner": {"model_version": 0, "error": ""},
+            "model": {
+                "ready": True,
+                "latest_version": 0,
+                "latest_checksum": checksum,
+                "expected_latest_checksum": checksum,
+                "latest_ack_version": 0,
+                "latest_ack_status": "MODEL_LOAD_STATUS_LOADED",
+            },
+            "chain": {"ready": True},
+        }
+
+        def container_state(role):
+            if role == "client":
+                return {
+                    "exists": True,
+                    "running": False,
+                    "exit_code": 0,
+                }
+            return {"exists": True, "running": True, "exit_code": 0}
+
+        with (
+            mock.patch.object(
+                runtime, "_container_state", side_effect=container_state
+            ),
+            mock.patch.object(
+                runtime, "_http_json", return_value={"record": record}
+            ),
+            mock.patch.object(
+                runtime, "_container_metrics_latest", return_value=record
+            ),
+            mock.patch(
+                "framework_cli.runtime.time.time", return_value=101.0
+            ),
+        ):
+            self.assertEqual(runtime.status()["actual_status"], "ready")
+            record["actor"]["workload_mode"] = (
+                "WORKLOAD_MODE_MODEL_EVALUATION"
+            )
+            degraded = runtime.status()
+
+        self.assertEqual(degraded["actual_status"], "degraded")
+        self.assertIn(
+            "actor_workload_mismatch", degraded["readiness"]["reasons"]
         )
 
     def test_required_quiesce_failure_is_reported_after_cleanup(self):

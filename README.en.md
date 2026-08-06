@@ -47,6 +47,14 @@ Use an existing RunSpec:
 ./framework stop --run-spec run-spec.json --json
 ```
 
+Platform `start` returns after a fresh training workload, Sample Pool readiness,
+model version/checksum/ACK identity, and host/container Actor and Sample Pool
+stream identities converge; the containers keep running.
+`status` continuously projects runtime health, and `stop` can cancel a start that
+is still waiting for readiness. `local-test --profile training` remains the
+synchronous black-box acceptance path and also waits for Client completion,
+sample conservation, PPO updates, and model-artifact checks.
+
 The default image tag is `training-001`. RunSpec v2 stores each role's image repository, tag, command, arguments, and CPU/memory/GPU limits, and requires AIServer and Client to share a host. Framework creates a dedicated Docker network and component directories for every Run. Task and Run identity remain in Docker labels and external receipts only.
 
 Training exposes only metrics port `9005` to the host; `9002/9100/9200` remain internal to the task network. Inference and model evaluation expose only replay port `9004`.

@@ -46,6 +46,12 @@
 ./framework stop --run-spec run-spec.json --json
 ```
 
+平台 `start` 在 fresh training workload、Sample Pool readiness、模型
+version/checksum/ACK，以及宿主与 Learner 容器内的 Actor/Sample Pool 实例身份
+一致后返回，训练容器继续运行；`status` 持续投影运行态，
+`stop` 可取消仍在等待 readiness 的启动。`local-test --profile training` 则保留
+同步黑盒验收，会继续等待 Client 完成、样本守恒、PPO 更新和模型制品检查。
+
 默认镜像 tag 为 `training-001`。RunSpec v2 分别保存三个角色的镜像仓库、tag、启动命令、参数与 CPU/内存/GPU 限制，并要求 AIServer 与 Client 同机部署。Framework 为每个 Run 创建独立 Docker 网络和组件目录，仅在 Docker 标签和外部回执中保存 Task/Run 身份。
 
 训练只向宿主映射指标端口 `9005`；`9002/9100/9200` 仅在任务网络内可见。推理和模型评估只映射回放端口 `9004`。

@@ -24,6 +24,362 @@ class RuntimeFailure(RuntimeError):
     pass
 
 
+def learner_monitor_transport_readiness(
+    host_status: dict[str, Any],
+    container_status: dict[str, Any],
+    *,
+    minimum_timestamp: float = 0.0,
+    now: float | None = None,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    current_time = time.time() if now is None else now
+    required_identity = (
+        "service_instance_id",
+        "metrics_source_id",
+        "started_at",
+        "metrics_dir",
+    )
+
+    for source, document in (
+        ("host", host_status),
+        ("container", container_status),
+    ):
+        if not isinstance(document, dict) or not document:
+            reasons.append(f"{source}_status_missing")
+            continue
+        if document.get("schema_version") != 1:
+            reasons.append(f"{source}_schema_mismatch")
+        if document.get("service") != "learner-metrics":
+            reasons.append(f"{source}_service_mismatch")
+        if document.get("stream") != "current":
+            reasons.append(f"{source}_stream_mismatch")
+        if document.get("mode") != "training":
+            reasons.append(f"{source}_mode_mismatch")
+        if document.get("stale") is not False:
+            reasons.append(f"{source}_metrics_stale")
+        for field in required_identity:
+            if document.get(field) in (None, ""):
+                reasons.append(f"{source}_{field}_missing")
+        if not str(document.get("metrics_dir", "")).endswith(
+            "/models/local-train/metrics"
+        ):
+            reasons.append(f"{source}_metrics_dir_mismatch")
+        try:
+            started_at = float(document.get("started_at", 0.0))
+        except (TypeError, ValueError):
+            started_at = 0.0
+            reasons.append(f"{source}_started_at_invalid")
+        try:
+            latest_timestamp = float(
+                document.get("latest_timestamp", 0.0)
+            )
+        except (TypeError, ValueError):
+            latest_timestamp = 0.0
+            reasons.append(f"{source}_latest_timestamp_invalid")
+        try:
+            latest_sequence = int(document.get("latest_sequence", 0))
+        except (TypeError, ValueError):
+            latest_sequence = 0
+            reasons.append(f"{source}_latest_sequence_invalid")
+        if started_at < minimum_timestamp:
+            reasons.append(f"{source}_service_predates_launch")
+        if latest_timestamp < started_at:
+            reasons.append(f"{source}_metrics_predate_service")
+        if latest_timestamp > current_time + 5.0:
+            reasons.append(f"{source}_metrics_timestamp_future")
+        if latest_sequence < 1:
+            reasons.append(f"{source}_latest_sequence_missing")
+
+    if host_status and container_status:
+        for field in required_identity:
+            if host_status.get(field) != container_status.get(field):
+                reasons.append(f"monitor_{field}_mismatch")
+        try:
+            host_sequence = int(host_status.get("latest_sequence", 0))
+            container_sequence = int(
+                container_status.get("latest_sequence", 0)
+            )
+        except (TypeError, ValueError):
+            host_sequence = 0
+            container_sequence = 0
+        if host_sequence > container_sequence:
+            reasons.append("monitor_sequence_ahead_of_container")
+
+    return {
+        "ready": not reasons,
+        "reasons": list(dict.fromkeys(reasons)),
+        "service_instance_id": host_status.get(
+            "service_instance_id", ""
+        ),
+        "metrics_source_id": host_status.get("metrics_source_id", ""),
+    }
+
+
+def training_record_readiness(
+    record: dict[str, Any],
+    *,
+    minimum_timestamp: float = 0.0,
+    now: float | None = None,
+    container_record: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    current_time = time.time() if now is None else now
+    if not record:
+        return {
+            "ready": False,
+            "reasons": ["metrics_missing"],
+            "timestamp": 0.0,
+            "age_seconds": None,
+            "model_lag": None,
+        }
+
+    try:
+        timestamp = float(record.get("timestamp", 0.0))
+    except (TypeError, ValueError):
+        timestamp = 0.0
+    try:
+        interval_seconds = max(
+            0.0, float(record.get("interval_ms", 0.0)) / 1000.0
+        )
+    except (TypeError, ValueError):
+        interval_seconds = 0.0
+    stale_after = max(5.0, 3.0 * interval_seconds)
+    age_seconds = max(0.0, current_time - timestamp) if timestamp else None
+    if timestamp < minimum_timestamp:
+        reasons.append("metrics_predate_launch")
+    if timestamp > current_time + 5.0:
+        reasons.append("metrics_timestamp_future")
+    if age_seconds is None or age_seconds > stale_after:
+        reasons.append("metrics_stale")
+    if record.get("mode") != "training":
+        reasons.append("metrics_mode_mismatch")
+
+    actor = record.get("actor") if isinstance(record.get("actor"), dict) else {}
+    distributor = (
+        record.get("distributor")
+        if isinstance(record.get("distributor"), dict)
+        else {}
+    )
+    learner = (
+        record.get("learner")
+        if isinstance(record.get("learner"), dict)
+        else {}
+    )
+    model = record.get("model") if isinstance(record.get("model"), dict) else {}
+    chain = record.get("chain") if isinstance(record.get("chain"), dict) else {}
+
+    if not actor.get("ready"):
+        reasons.append("actor_not_ready")
+    if not actor.get("instance_id"):
+        reasons.append("actor_instance_missing")
+    if actor.get("workload_mode") != "WORKLOAD_MODE_TRAINING":
+        reasons.append("actor_workload_mismatch")
+    for field in ("ready", "ingress_ready", "pool_ready"):
+        if not distributor.get(field):
+            reasons.append(f"sample_pool_{field}_false")
+    if not distributor.get("instance_id"):
+        reasons.append("sample_pool_instance_missing")
+    if not model.get("ready"):
+        reasons.append("model_distributor_not_ready")
+    if learner.get("error"):
+        reasons.append("learner_error")
+    if chain.get("ready") is not True:
+        reasons.append("learner_chain_not_ready")
+
+    def integer(document: dict, field: str, default: int = -1) -> int:
+        try:
+            return int(document.get(field, default))
+        except (TypeError, ValueError):
+            return default
+
+    learner_version = integer(learner, "model_version")
+    actor_version = integer(actor, "model_version")
+    latest_version = integer(model, "latest_version")
+    latest_ack_version = integer(model, "latest_ack_version")
+    model_lag = learner_version - actor_version
+    if learner_version < 0 or latest_version != learner_version:
+        reasons.append("published_model_version_mismatch")
+    if actor_version < 0 or model_lag < 0 or model_lag > 1:
+        reasons.append("actor_model_lag_invalid")
+    if latest_ack_version != actor_version:
+        reasons.append("actor_model_ack_mismatch")
+    if model.get("latest_ack_status") != "MODEL_LOAD_STATUS_LOADED":
+        reasons.append("actor_model_ack_not_loaded")
+
+    actor_checksum = str(actor.get("model_checksum", ""))
+    expected_actor_checksum = str(actor.get("expected_model_checksum", ""))
+    if not expected_actor_checksum and actor_version == latest_version:
+        expected_actor_checksum = str(model.get("latest_checksum", ""))
+    if (
+        not actor_checksum
+        or not expected_actor_checksum
+        or actor_checksum != expected_actor_checksum
+    ):
+        reasons.append("actor_model_checksum_mismatch")
+    latest_checksum = str(model.get("latest_checksum", ""))
+    expected_latest_checksum = str(model.get("expected_latest_checksum", ""))
+    if expected_latest_checksum and latest_checksum != expected_latest_checksum:
+        reasons.append("published_model_checksum_mismatch")
+    if not latest_checksum:
+        reasons.append("published_model_checksum_missing")
+
+    if container_record is not None:
+        if not container_record:
+            reasons.append("container_metrics_unreachable")
+        else:
+            container_actor = (
+                container_record.get("actor")
+                if isinstance(container_record.get("actor"), dict)
+                else {}
+            )
+            container_distributor = (
+                container_record.get("distributor")
+                if isinstance(container_record.get("distributor"), dict)
+                else {}
+            )
+            if actor.get("instance_id") != container_actor.get("instance_id"):
+                reasons.append("container_actor_identity_mismatch")
+            if distributor.get("instance_id") != container_distributor.get(
+                "instance_id"
+            ):
+                reasons.append("container_sample_pool_identity_mismatch")
+            if integer(record, "sequence", 0) > integer(
+                container_record, "sequence", 0
+            ):
+                reasons.append("container_metrics_sequence_mismatch")
+
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "timestamp": timestamp,
+        "age_seconds": age_seconds,
+        "stale_after_seconds": stale_after,
+        "model_lag": model_lag,
+        "actor_instance_id": actor.get("instance_id", ""),
+        "sample_pool_instance_id": distributor.get("instance_id", ""),
+    }
+
+
+def training_completion_status(
+    record: dict[str, Any], expected_samples: int
+) -> dict[str, Any]:
+    actor = record.get("actor") if isinstance(record.get("actor"), dict) else {}
+    distributor = (
+        record.get("distributor")
+        if isinstance(record.get("distributor"), dict)
+        else {}
+    )
+    learner = (
+        record.get("learner")
+        if isinstance(record.get("learner"), dict)
+        else {}
+    )
+
+    def integer(document: dict[str, Any], field: str, default: int = 0) -> int:
+        try:
+            return int(document.get(field, default))
+        except (TypeError, ValueError):
+            return default
+
+    counts = {
+        "expected": int(expected_samples),
+        "produced": integer(actor, "produced"),
+        "outbound_pending": integer(actor, "outbound_pending"),
+        "final_drop": integer(actor, "final_drop"),
+        "accepted": integer(distributor, "accepted"),
+        "acked": integer(distributor, "acked"),
+        "ready": integer(distributor, "ready_samples"),
+        "leased": integer(distributor, "leased_samples"),
+        "trained": integer(distributor, "trained"),
+        "stale": integer(distributor, "stale"),
+        "invalid": integer(distributor, "invalid"),
+        "shutdown_untrained": integer(distributor, "shutdown_untrained"),
+        "learner_run_trained": integer(learner, "run_trained_samples", -1),
+        "learner_run_updates": integer(learner, "run_train_updates", -1),
+        "train_batch_size": integer(learner, "train_batch_size", -1),
+        "initial_model_version": integer(
+            learner, "initial_model_version", -1
+        ),
+        "model_version": integer(learner, "model_version", -1),
+    }
+    reasons: list[str] = []
+    fatal_reasons: list[str] = []
+
+    for field in ("stale", "invalid", "shutdown_untrained"):
+        if counts[field] != 0:
+            reason = f"non_trained_disposition_{field}"
+            reasons.append(reason)
+            fatal_reasons.append(reason)
+    if counts["final_drop"] != 0:
+        reasons.append("actor_final_drop_nonzero")
+        fatal_reasons.append("actor_final_drop_nonzero")
+
+    for field in ("produced", "accepted", "acked", "trained"):
+        if counts[field] > expected_samples:
+            reason = f"{field}_exceeds_expected"
+            reasons.append(reason)
+            fatal_reasons.append(reason)
+    if counts["learner_run_trained"] > expected_samples:
+        reasons.append("learner_run_trained_exceeds_expected")
+        fatal_reasons.append("learner_run_trained_exceeds_expected")
+
+    if counts["produced"] != (
+        counts["accepted"]
+        + counts["outbound_pending"]
+        + counts["final_drop"]
+    ):
+        reasons.append("actor_sample_conservation_mismatch")
+    if counts["accepted"] != (
+        counts["ready"] + counts["leased"] + counts["acked"]
+    ):
+        reasons.append("sample_pool_resident_conservation_mismatch")
+    if counts["acked"] != (
+        counts["trained"]
+        + counts["stale"]
+        + counts["invalid"]
+        + counts["shutdown_untrained"]
+    ):
+        reasons.append("ack_disposition_conservation_mismatch")
+
+    batch_size = counts["train_batch_size"]
+    expected_updates = (
+        expected_samples // batch_size
+        if batch_size > 0 and expected_samples % batch_size == 0
+        else -1
+    )
+    counts["expected_updates"] = expected_updates
+    if expected_updates < 0:
+        reasons.append("expected_samples_not_divisible_by_train_batch")
+    if counts["learner_run_updates"] != expected_updates:
+        reasons.append("learner_run_update_count_mismatch")
+    if counts["learner_run_trained"] != expected_samples:
+        reasons.append("learner_run_trained_count_mismatch")
+    if (
+        counts["model_version"] - counts["initial_model_version"]
+        != counts["learner_run_updates"]
+    ):
+        reasons.append("model_version_delta_mismatch")
+
+    for field in ("produced", "accepted", "acked", "trained"):
+        if counts[field] != expected_samples:
+            reasons.append(f"{field}_not_expected")
+    if counts["outbound_pending"] != 0:
+        reasons.append("actor_outbound_pending_nonzero")
+    if counts["ready"] != 0:
+        reasons.append("sample_pool_ready_nonzero")
+    if counts["leased"] != 0:
+        reasons.append("sample_pool_leased_nonzero")
+
+    reasons = list(dict.fromkeys(reasons))
+    return {
+        "complete": not reasons,
+        "failed": bool(fatal_reasons),
+        "reasons": reasons,
+        "fatal_reasons": list(dict.fromkeys(fatal_reasons)),
+        "counts": counts,
+    }
+
+
 def workspace_root() -> Path:
     configured = os.environ.get("RL_TRAINING_WORKSPACE")
     if configured:
@@ -502,20 +858,30 @@ class DockerRuntime:
         document.setdefault("ports", {})[str(port)] = transport
         self._atomic_json(path, document)
 
-    def _ensure_host_port(self, port: int, timeout: float) -> None:
+    def _ensure_host_port(
+        self,
+        port: int,
+        timeout: float,
+        *,
+        record_transport: bool = True,
+    ) -> str:
         direct_deadline = time.monotonic() + min(timeout, 3.0)
         while time.monotonic() < direct_deadline:
             if self._tcp_ready(port):
-                self._record_port_transport(port, "docker-publish")
-                return
+                transport = "docker-publish"
+                if record_transport:
+                    self._record_port_transport(port, transport)
+                return transport
             time.sleep(0.2)
 
         config_path = self._colima_ssh_config()
         ssh = shutil.which("ssh")
         if config_path is None or ssh is None:
             self._wait_tcp(port, max(0.0, timeout - 3.0))
-            self._record_port_transport(port, "docker-publish")
-            return
+            transport = "docker-publish"
+            if record_transport:
+                self._record_port_transport(port, transport)
+            return transport
 
         self.tunnel_root.mkdir(parents=True, exist_ok=True)
         socket_path = self._tunnel_socket(port)
@@ -574,7 +940,10 @@ class DockerRuntime:
             },
         )
         self._wait_tcp(port, max(1.0, timeout - 3.0))
-        self._record_port_transport(port, "colima-ssh-tunnel")
+        transport = "colima-ssh-tunnel"
+        if record_transport:
+            self._record_port_transport(port, transport)
+        return transport
 
     def _stop_port_tunnels(self) -> None:
         if not self.tunnel_root.is_dir():
@@ -635,6 +1004,107 @@ class DockerRuntime:
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
             raise RuntimeFailure(f"HTTP request failed for {url}: {exc}") from exc
 
+    def _container_metrics_latest(self) -> dict[str, Any]:
+        script = (
+            "import sys,urllib.request;"
+            "sys.stdout.write(urllib.request.urlopen("
+            "sys.argv[1],timeout=2).read().decode())"
+        )
+        result = self._docker(
+            [
+                "exec",
+                self._name("learner"),
+                "python3",
+                "-c",
+                script,
+                "http://127.0.0.1:9005/api/metrics/latest",
+            ],
+            check=False,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeFailure(
+                f"Learner container metrics are unavailable: {detail}"
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeFailure(
+                "Learner container metrics returned invalid JSON"
+            ) from exc
+        record = payload.get("record") if isinstance(payload, dict) else None
+        return record if isinstance(record, dict) else {}
+
+    def _container_metrics_status(self) -> dict[str, Any]:
+        script = (
+            "import sys,urllib.request;"
+            "sys.stdout.write(urllib.request.urlopen("
+            "sys.argv[1],timeout=2).read().decode())"
+        )
+        result = self._docker(
+            [
+                "exec",
+                self._name("learner"),
+                "python3",
+                "-c",
+                script,
+                "http://127.0.0.1:9005/api/status",
+            ],
+            check=False,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeFailure(
+                f"Learner container metrics status is unavailable: {detail}"
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeFailure(
+                "Learner container metrics status returned invalid JSON"
+            ) from exc
+        return payload if isinstance(payload, dict) else {}
+
+    def _wait_learner_monitor_transport(
+        self, minimum_timestamp: float, timeout: float
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        last_readiness = learner_monitor_transport_readiness(
+            {}, {}, minimum_timestamp=minimum_timestamp
+        )
+        endpoint_seen = False
+        while time.monotonic() < deadline:
+            try:
+                host_status = self._http_json(
+                    "http://127.0.0.1:9005/api/status"
+                )
+                endpoint_seen = True
+            except RuntimeFailure:
+                host_status = {}
+            try:
+                container_status = self._container_metrics_status()
+            except RuntimeFailure:
+                container_status = {}
+            last_readiness = learner_monitor_transport_readiness(
+                host_status,
+                container_status,
+                minimum_timestamp=minimum_timestamp,
+            )
+            if last_readiness["ready"]:
+                return last_readiness
+            time.sleep(0.2)
+        prefix = (
+            "PORT_IDENTITY_CONFLICT"
+            if endpoint_seen
+            else "MONITOR_TARGET_UNAVAILABLE"
+        )
+        raise RuntimeFailure(
+            f"{prefix}: learner monitor transport verification failed; "
+            f"reasons={last_readiness['reasons']}"
+        )
+
     def _wait_metrics(self, timeout: float) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         expected = self.spec.expected_samples
@@ -649,34 +1119,61 @@ class DockerRuntime:
             except RuntimeFailure:
                 time.sleep(0.3)
                 continue
-            actor = last_record.get("actor", {})
-            distributor = last_record.get("distributor", {})
-            learner = last_record.get("learner", {})
-            model = last_record.get("model", {})
-            produced = int(actor.get("produced", 0))
-            accepted = int(distributor.get("accepted", 0))
-            acked = int(distributor.get("acked", 0))
-            final_drop = int(actor.get("final_drop", 0))
-            train_updates = int(learner.get("train_updates", 0))
-            model_version = int(learner.get("model_version", 0))
-            loaded_version = int(actor.get("model_version", -1))
-            latest_ack_version = int(model.get("latest_ack_version", -1))
-            if (
-                (produced, accepted, acked, final_drop)
-                == (expected, expected, expected, 0)
-                and train_updates >= 2
-                and model_version >= 2
-                and loaded_version >= 1
-                and latest_ack_version >= 1
-            ):
+            completion = training_completion_status(last_record, expected)
+            if completion["complete"]:
                 return last_record
-            if any(value > expected for value in (produced, accepted, acked)):
+            if completion["failed"]:
                 raise RuntimeFailure(
-                    "sample counters exceeded the RunSpec expected total"
+                    "training completion gate failed: "
+                    + ",".join(completion["fatal_reasons"])
                 )
             time.sleep(0.5)
         raise RuntimeFailure(
             f"training loop timeout; expected={expected}, last={last_record}"
+        )
+
+    def _wait_training_ready(
+        self, minimum_timestamp: float, timeout: float
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        deadline = time.monotonic() + timeout
+        url = "http://127.0.0.1:9005/api/metrics/latest"
+        last_record: dict[str, Any] = {}
+        last_readiness = training_record_readiness(
+            last_record, minimum_timestamp=minimum_timestamp
+        )
+        while time.monotonic() < deadline:
+            self._require_running("learner")
+            self._require_running("aiserver")
+            client = self._container_state("client")
+            if (
+                client.get("exists")
+                and not client.get("running")
+                and int(client.get("exit_code", 0)) != 0
+            ):
+                raise RuntimeFailure(
+                    f"client exited before training readiness: {client}"
+                )
+            try:
+                payload = self._http_json(url)
+                last_record = payload.get("record", {})
+            except RuntimeFailure:
+                time.sleep(0.3)
+                continue
+            try:
+                container_record = self._container_metrics_latest()
+            except RuntimeFailure:
+                container_record = {}
+            last_readiness = training_record_readiness(
+                last_record,
+                minimum_timestamp=minimum_timestamp,
+                container_record=container_record,
+            )
+            if last_readiness["ready"]:
+                return last_record, last_readiness
+            time.sleep(0.3)
+        raise RuntimeFailure(
+            "training readiness timeout; "
+            f"reasons={last_readiness['reasons']}, last={last_record}"
         )
 
     def _validate_training_artifacts(
@@ -849,7 +1346,7 @@ class DockerRuntime:
             "MAZE_SESSION_ID=0",
         ]
 
-    def start(self) -> dict[str, Any]:
+    def start(self, *, wait_for_completion: bool = False) -> dict[str, Any]:
         self.preflight()
         self.stop_run()
         self.run_root.mkdir(parents=True, exist_ok=True)
@@ -865,7 +1362,9 @@ class DockerRuntime:
             self._assert_host_ports_available(required_ports)
             self._ensure_network()
             if self.spec.mode == "training":
-                result = self._start_training()
+                result = self._start_training(
+                    wait_for_completion=wait_for_completion
+                )
             else:
                 result = self._start_replay_workload()
             self._write_state("ready", result=result)
@@ -876,7 +1375,10 @@ class DockerRuntime:
             self.stop_run()
             raise
 
-    def _start_training(self) -> dict[str, Any]:
+    def _start_training(
+        self, *, wait_for_completion: bool = False
+    ) -> dict[str, Any]:
+        launch_started_at = time.time()
         learner_logs = self.run_root / "learner/logs"
         learner_local_train = self.run_root / "learner-local-train"
         aiserver_local_train = self.run_root / "aiserver-local-train"
@@ -936,7 +1438,11 @@ class DockerRuntime:
             learner_arguments,
         )
         self._wait_healthy("learner", 180)
-        self._ensure_host_port(9005, 180)
+        monitor_transport = self._ensure_host_port(
+            9005, 180, record_transport=False
+        )
+        self._wait_learner_monitor_transport(launch_started_at, 15)
+        self._record_port_transport(9005, monitor_transport)
         self._record("learner_pod_ready")
 
         self._run_container(
@@ -981,6 +1487,56 @@ class DockerRuntime:
             ],
         )
         self._record("client_started")
+        readiness_record, readiness = self._wait_training_ready(
+            launch_started_at, 90
+        )
+        self._record("training_chain_ready")
+        if not wait_for_completion:
+            actor = readiness_record.get("actor", {})
+            distributor = readiness_record.get("distributor", {})
+            learner = readiness_record.get("learner", {})
+            client_state = self._container_state("client")
+            self._record("training_ready")
+            monitor_source = (
+                "local-dev" if self.runtime_scope == "local-tests" else "platform"
+            )
+            return {
+                "schema_version": 1,
+                "task_id": self.spec.task_id,
+                "run_id": self.spec.run_id,
+                "mode": self.spec.mode,
+                "actual_status": "ready",
+                "phase": (
+                    "running"
+                    if client_state.get("running")
+                    else "workload-completed"
+                ),
+                "readiness": readiness,
+                "counts": {
+                    "expected": self.spec.expected_samples,
+                    "produced": int(actor.get("produced", 0)),
+                    "accepted": int(distributor.get("accepted", 0)),
+                    "acked": int(distributor.get("acked", 0)),
+                    "final_drop": int(actor.get("final_drop", 0)),
+                },
+                "train_updates": int(learner.get("train_updates", 0)),
+                "model_version": int(learner.get("model_version", 0)),
+                "monitor_url": (
+                    "http://127.0.0.1:9005/"
+                    if self.runtime_scope == "local-tests"
+                    else (
+                        "http://127.0.0.1:9010/infra?"
+                        f"source={monitor_source}&run_id="
+                        f"{urllib.parse.quote(self.spec.run_id)}"
+                    )
+                ),
+                "ports": {"learner_metrics": 9005},
+                "internal_ports": {
+                    "aiserver": 9002,
+                    "local_sample_service": 9100,
+                    "model_distributor": 9200,
+                },
+            }
         client_exit = self._wait_container_exit("client", 300)
         if client_exit != 0:
             logs = self._docker(
@@ -1009,26 +1565,18 @@ class DockerRuntime:
         if "9004" in client_ports.stdout:
             raise RuntimeFailure("training Client published Replay port 9004")
         self._record("training_ready")
-        counts = {
-            "expected": self.spec.expected_samples,
-            "produced": int(metrics["actor"]["produced"]),
-            "accepted": int(metrics["distributor"]["accepted"]),
-            "acked": int(metrics["distributor"]["acked"]),
-            "final_drop": int(metrics["actor"]["final_drop"]),
-            "ready": int(metrics["distributor"]["ready_samples"]),
-            "leased": int(metrics["distributor"]["leased_samples"]),
-        }
-        if (
-            counts["produced"]
-            != counts["accepted"] + int(metrics["actor"]["outbound_pending"])
-            + counts["final_drop"]
-            or counts["accepted"]
-            != counts["ready"] + counts["leased"] + counts["acked"]
-        ):
-            raise RuntimeFailure("training sample conservation is violated")
+        completion = training_completion_status(
+            metrics, self.spec.expected_samples
+        )
+        if not completion["complete"]:
+            raise RuntimeFailure(
+                "training completion changed before artifact validation: "
+                + ",".join(completion["reasons"])
+            )
+        counts = completion["counts"]
         self._atomic_json(
             self.run_root / "sample-conservation.json",
-            {"schema_version": 1, "run_id": self.spec.run_id, **counts},
+            {"schema_version": 2, "run_id": self.spec.run_id, **counts},
         )
         return {
             "schema_version": 1,
@@ -1041,8 +1589,12 @@ class DockerRuntime:
             "train_updates": int(metrics["learner"]["train_updates"]),
             "trained_samples": int(metrics["learner"]["trained_samples"]),
             "monitor_url": (
-                "http://127.0.0.1:9010/infra?"
-                f"source=local-dev&run_id={urllib.parse.quote(self.spec.run_id)}"
+                "http://127.0.0.1:9005/"
+                if self.runtime_scope == "local-tests"
+                else (
+                    "http://127.0.0.1:9010/infra?source=platform&run_id="
+                    f"{urllib.parse.quote(self.spec.run_id)}"
+                )
             ),
             "ports": {
                 "learner_metrics": 9005,
@@ -1241,6 +1793,7 @@ class DockerRuntime:
             for role in ("learner", "aiserver", "client")
         }
         metrics = {}
+        readiness: dict[str, Any] = {}
         if self.spec.mode == "training" and containers["learner"].get("running"):
             try:
                 metrics = self._http_json(
@@ -1248,12 +1801,51 @@ class DockerRuntime:
                 ).get("record", {})
             except RuntimeFailure:
                 metrics = {}
+            try:
+                container_metrics = self._container_metrics_latest()
+            except RuntimeFailure:
+                container_metrics = {}
+            persisted_readiness = (
+                persisted.get("result", {}).get("readiness", {})
+                if isinstance(persisted.get("result"), dict)
+                else {}
+            )
+            minimum_timestamp = max(
+                0.0,
+                float(persisted_readiness.get("timestamp", 0.0)) - 0.001,
+            )
+            readiness = training_record_readiness(
+                metrics,
+                minimum_timestamp=minimum_timestamp,
+                container_record=container_metrics,
+            )
+        actual_status = persisted.get("actual_status", "unknown")
+        if self.spec.mode == "training" and actual_status in {
+            "starting",
+            "ready",
+            "degraded",
+        }:
+            required_running = all(
+                containers[role].get("running")
+                for role in ("learner", "aiserver")
+            )
+            client_failed = bool(
+                containers["client"].get("exists")
+                and not containers["client"].get("running")
+                and int(containers["client"].get("exit_code", 0)) != 0
+            )
+            if required_running and readiness.get("ready") and not client_failed:
+                actual_status = "ready"
+            elif actual_status != "starting":
+                actual_status = "degraded"
         return {
             "schema_version": 1,
             "task_id": self.spec.task_id,
             "run_id": self.spec.run_id,
             "mode": self.spec.mode,
+            "actual_status": actual_status,
             "persisted": persisted,
             "containers": containers,
             "metrics": metrics,
+            "readiness": readiness,
         }

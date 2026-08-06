@@ -177,7 +177,7 @@ def execute(args: argparse.Namespace) -> dict:
         runtime = DockerRuntime(spec, runtime_scope="local-tests")
         started_at = time.time()
         try:
-            result = runtime.start()
+            result = runtime.start(wait_for_completion=True)
         except Exception as exc:
             runtime._atomic_json(
                 runtime.run_root / "acceptance.json",
