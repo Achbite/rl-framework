@@ -173,8 +173,6 @@ def training_record_readiness(
         reasons.append("actor_not_ready")
     if not actor.get("instance_id"):
         reasons.append("actor_instance_missing")
-    if actor.get("workload_mode") != "WORKLOAD_MODE_TRAINING":
-        reasons.append("actor_workload_mismatch")
     for field in ("ready", "ingress_ready", "pool_ready"):
         if not distributor.get(field):
             reasons.append(f"sample_pool_{field}_false")
@@ -193,36 +191,63 @@ def training_record_readiness(
         except (TypeError, ValueError):
             return default
 
-    learner_version = integer(learner, "model_version")
-    actor_version = integer(actor, "model_version")
-    latest_version = integer(model, "latest_version")
-    latest_ack_version = integer(model, "latest_ack_version")
+    def model_identity(document: dict, field: str) -> dict[str, Any]:
+        value = document.get(field)
+        return value if isinstance(value, dict) else {}
+
+    def valid_model_identity(identity: dict[str, Any]) -> bool:
+        version = identity.get("model_version")
+        return (
+            isinstance(identity.get("model_lineage_id"), str)
+            and bool(identity.get("model_lineage_id"))
+            and isinstance(version, int)
+            and not isinstance(version, bool)
+            and version >= 0
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(identity.get("artifact_digest", "")),
+            )
+            is not None
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(identity.get("manifest_digest", "")),
+            )
+            is not None
+        )
+
+    learner_identity = model_identity(learner, "model_identity")
+    actor_identity = model_identity(actor, "model_identity")
+    latest_identity = model_identity(model, "latest_model_identity")
+    latest_ack_identity = model_identity(
+        model, "latest_ack_model_identity"
+    )
+    for name, identity in (
+        ("learner_model_identity_invalid", learner_identity),
+        ("actor_model_identity_invalid", actor_identity),
+        ("published_model_identity_invalid", latest_identity),
+        ("actor_ack_identity_invalid", latest_ack_identity),
+    ):
+        if not valid_model_identity(identity):
+            reasons.append(name)
+
+    learner_version = integer(learner_identity, "model_version")
+    actor_version = integer(actor_identity, "model_version")
+    max_policy_lag = integer(learner, "max_policy_lag")
     model_lag = learner_version - actor_version
-    if learner_version < 0 or latest_version != learner_version:
-        reasons.append("published_model_version_mismatch")
-    if actor_version < 0 or model_lag < 0 or model_lag > 1:
+    if latest_identity != learner_identity:
+        reasons.append("published_model_identity_mismatch")
+    if (
+        actor_version < 0
+        or learner_version < 0
+        or max_policy_lag < 0
+        or model_lag < 0
+        or model_lag > max_policy_lag
+    ):
         reasons.append("actor_model_lag_invalid")
-    if latest_ack_version != actor_version:
+    if latest_ack_identity != actor_identity:
         reasons.append("actor_model_ack_mismatch")
     if model.get("latest_ack_status") != "MODEL_LOAD_STATUS_LOADED":
         reasons.append("actor_model_ack_not_loaded")
-
-    actor_checksum = str(actor.get("model_checksum", ""))
-    expected_actor_checksum = str(actor.get("expected_model_checksum", ""))
-    if not expected_actor_checksum and actor_version == latest_version:
-        expected_actor_checksum = str(model.get("latest_checksum", ""))
-    if (
-        not actor_checksum
-        or not expected_actor_checksum
-        or actor_checksum != expected_actor_checksum
-    ):
-        reasons.append("actor_model_checksum_mismatch")
-    latest_checksum = str(model.get("latest_checksum", ""))
-    expected_latest_checksum = str(model.get("expected_latest_checksum", ""))
-    if expected_latest_checksum and latest_checksum != expected_latest_checksum:
-        reasons.append("published_model_checksum_mismatch")
-    if not latest_checksum:
-        reasons.append("published_model_checksum_missing")
 
     if container_record is not None:
         if not container_record:

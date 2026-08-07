@@ -241,6 +241,18 @@ class RuntimePortTransportTest(unittest.TestCase):
         record.assert_not_called()
 
     def test_training_readiness_requires_fresh_consistent_training_identity(self):
+        actor_identity = {
+            "model_lineage_id": "maze-fixed-map-seed-0",
+            "model_version": 1,
+            "artifact_digest": "a" * 64,
+            "manifest_digest": "b" * 64,
+        }
+        learner_identity = {
+            "model_lineage_id": "maze-fixed-map-seed-0",
+            "model_version": 2,
+            "artifact_digest": "c" * 64,
+            "manifest_digest": "d" * 64,
+        }
         record = {
             "mode": "training",
             "timestamp": 100.0,
@@ -248,10 +260,7 @@ class RuntimePortTransportTest(unittest.TestCase):
             "actor": {
                 "ready": True,
                 "instance_id": "actor-1",
-                "workload_mode": "WORKLOAD_MODE_TRAINING",
-                "model_version": 1,
-                "model_checksum": "a" * 64,
-                "expected_model_checksum": "a" * 64,
+                "model_identity": actor_identity,
             },
             "distributor": {
                 "ready": True,
@@ -259,13 +268,16 @@ class RuntimePortTransportTest(unittest.TestCase):
                 "pool_ready": True,
                 "instance_id": "pool-1",
             },
-            "learner": {"model_version": 2, "error": ""},
+            "learner": {
+                "model_identity": learner_identity,
+                "model_version": 2,
+                "max_policy_lag": 2,
+                "error": "",
+            },
             "model": {
                 "ready": True,
-                "latest_version": 2,
-                "latest_checksum": "b" * 64,
-                "expected_latest_checksum": "b" * 64,
-                "latest_ack_version": 1,
+                "latest_model_identity": learner_identity,
+                "latest_ack_model_identity": actor_identity,
                 "latest_ack_status": "MODEL_LOAD_STATUS_LOADED",
             },
             "chain": {"ready": True},
@@ -277,15 +289,16 @@ class RuntimePortTransportTest(unittest.TestCase):
         self.assertTrue(readiness["ready"])
         self.assertEqual(readiness["model_lag"], 1)
 
-        record["actor"]["workload_mode"] = (
-            "WORKLOAD_MODE_MODEL_EVALUATION"
-        )
+        record["actor"]["model_identity"] = {
+            **actor_identity,
+            "artifact_digest": "e" * 64,
+        }
         mismatch = training_record_readiness(
             record, minimum_timestamp=99.0, now=101.0
         )
-        self.assertIn("actor_workload_mismatch", mismatch["reasons"])
+        self.assertIn("actor_model_ack_mismatch", mismatch["reasons"])
 
-        record["actor"]["workload_mode"] = "WORKLOAD_MODE_TRAINING"
+        record["actor"]["model_identity"] = actor_identity
         stale = training_record_readiness(
             record, minimum_timestamp=101.0, now=110.0
         )
@@ -856,6 +869,12 @@ class RuntimePortTransportTest(unittest.TestCase):
     def test_status_degrades_when_live_chain_identity_does_not_match(self):
         runtime = DockerRuntime(self.spec)
         checksum = "a" * 64
+        identity = {
+            "model_lineage_id": "maze-fixed-map-seed-0",
+            "model_version": 0,
+            "artifact_digest": checksum,
+            "manifest_digest": "b" * 64,
+        }
         timestamp = 100.0
         runtime._write_state(
             "ready",
@@ -868,10 +887,7 @@ class RuntimePortTransportTest(unittest.TestCase):
             "actor": {
                 "ready": True,
                 "instance_id": "actor-status",
-                "workload_mode": "WORKLOAD_MODE_TRAINING",
-                "model_version": 0,
-                "model_checksum": checksum,
-                "expected_model_checksum": checksum,
+                "model_identity": identity,
             },
             "distributor": {
                 "ready": True,
@@ -879,13 +895,16 @@ class RuntimePortTransportTest(unittest.TestCase):
                 "ingress_ready": True,
                 "pool_ready": True,
             },
-            "learner": {"model_version": 0, "error": ""},
+            "learner": {
+                "model_identity": identity,
+                "model_version": 0,
+                "max_policy_lag": 2,
+                "error": "",
+            },
             "model": {
                 "ready": True,
-                "latest_version": 0,
-                "latest_checksum": checksum,
-                "expected_latest_checksum": checksum,
-                "latest_ack_version": 0,
+                "latest_model_identity": identity,
+                "latest_ack_model_identity": identity,
                 "latest_ack_status": "MODEL_LOAD_STATUS_LOADED",
             },
             "chain": {"ready": True},
@@ -915,14 +934,15 @@ class RuntimePortTransportTest(unittest.TestCase):
             ),
         ):
             self.assertEqual(runtime.status()["actual_status"], "ready")
-            record["actor"]["workload_mode"] = (
-                "WORKLOAD_MODE_MODEL_EVALUATION"
-            )
+            record["actor"]["model_identity"] = {
+                **identity,
+                "manifest_digest": "c" * 64,
+            }
             degraded = runtime.status()
 
         self.assertEqual(degraded["actual_status"], "degraded")
         self.assertIn(
-            "actor_workload_mismatch", degraded["readiness"]["reasons"]
+            "actor_model_ack_mismatch", degraded["readiness"]["reasons"]
         )
 
     def test_required_quiesce_failure_is_reported_after_cleanup(self):
