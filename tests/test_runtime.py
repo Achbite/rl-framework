@@ -323,14 +323,25 @@ class RuntimePortTransportTest(unittest.TestCase):
             (savepoint / "checkpoint.pt").write_bytes(b"checkpoint")
             checksum = hashlib.sha256(model.read_bytes()).hexdigest()
             archive_checksums[version] = checksum
+            identity = {
+                "model_lineage_id": "maze-fixed-map-seed-0",
+                "model_version": version,
+                "artifact_digest": checksum,
+                "manifest_digest": hashlib.sha256(
+                    f"archive-manifest-{version}".encode()
+                ).hexdigest(),
+            }
             (savepoint / "manifest.json").write_text(
                 json.dumps(
                     {
-                        "contract_version": "0.6.0",
-                        "model_version": version,
+                        "schema_version": 1,
+                        "runtime_manifest_identity": identity,
+                        "runtime_manifest_digest": identity[
+                            "manifest_digest"
+                        ],
                         "model_file": "SaveModel.onnx",
                         "checkpoint_file": "checkpoint.pt",
-                        "sha256": checksum,
+                        "artifact_digest": checksum,
                     }
                 ),
                 encoding="utf-8",
@@ -346,11 +357,20 @@ class RuntimePortTransportTest(unittest.TestCase):
                     {
                         "state": "ACKED",
                         "target_model_version": version,
-                        "behavior_model_version": version - 1,
+                        "behavior_model": {
+                            "model_lineage_id": "maze-fixed-map-seed-0",
+                            "model_version": 0,
+                            "artifact_digest": "d" * 64,
+                            "manifest_digest": "e" * 64,
+                        },
                         "train_update_id": f"update-{version}",
-                        "archive_committed": version == 2,
-                        "manifest": {
-                            "sha256": receipt_checksums[version],
+                        "model": {
+                            "model_lineage_id": "maze-fixed-map-seed-0",
+                            "model_version": version,
+                            "artifact_digest": receipt_checksums[version],
+                            "manifest_digest": hashlib.sha256(
+                                f"receipt-manifest-{version}".encode()
+                            ).hexdigest(),
                         },
                     }
                 ),
@@ -364,9 +384,21 @@ class RuntimePortTransportTest(unittest.TestCase):
             (serving / f"manifest_v{version:06d}.json").write_text(
                 json.dumps(
                     {
-                        "contract_version": "0.6.0",
-                        "model_version": version,
-                        "sha256": checksum,
+                        "manifest_schema_version": 1,
+                        "contract": {
+                            "package_name": "rl-contracts",
+                            "package_version": "0.10.0",
+                        },
+                        "identity": {
+                            "model_lineage_id": "maze-fixed-map-seed-0",
+                            "model_version": version,
+                            "artifact_digest": checksum,
+                            "manifest_digest": hashlib.sha256(
+                                f"runtime-manifest-{version}".encode()
+                            ).hexdigest(),
+                        },
+                        "model_file": model.name,
+                        "ready": True,
                     }
                 ),
                 encoding="utf-8",
@@ -392,6 +424,7 @@ class RuntimePortTransportTest(unittest.TestCase):
 
         self.assertEqual(result["archived_versions"], [0, 2])
         self.assertEqual(result["runtime_versions"], [1, 2])
+        self.assertEqual(result["v2_behavior_model_version"], 0)
 
     def test_tunnel_socket_is_short_and_stable(self):
         runtime = DockerRuntime(self.spec)

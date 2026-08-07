@@ -464,6 +464,77 @@ class DockerRuntime:
             "model_lineage_id": lineage_id,
         }
 
+    @staticmethod
+    def _runtime_model_identity(
+        manifest: dict[str, Any],
+        *,
+        version: int,
+        checksum: str,
+        model_file: str,
+    ) -> dict[str, Any]:
+        contract = manifest.get("contract")
+        identity = manifest.get("identity")
+        if (
+            manifest.get("manifest_schema_version") != 1
+            or not isinstance(contract, dict)
+            or contract.get("package_name") != "rl-contracts"
+            or contract.get("package_version") != "0.10.0"
+            or not isinstance(identity, dict)
+            or identity.get("model_version") != version
+            or identity.get("artifact_digest") != checksum
+            or manifest.get("model_file") != model_file
+            or manifest.get("ready") is not True
+            or "run_id" in manifest
+        ):
+            raise RuntimeFailure(
+                f"runtime model v{version} identity is invalid"
+            )
+        for field in ("artifact_digest", "manifest_digest"):
+            if re.fullmatch(
+                r"[0-9a-f]{64}", str(identity.get(field, ""))
+            ) is None:
+                raise RuntimeFailure(
+                    f"runtime model v{version} identity is invalid"
+                )
+        if not identity.get("model_lineage_id"):
+            raise RuntimeFailure(
+                f"runtime model v{version} identity is invalid"
+            )
+        return identity
+
+    @staticmethod
+    def _archive_model_identity(
+        manifest: dict[str, Any], *, version: int, checksum: str
+    ) -> dict[str, Any]:
+        identity = manifest.get("runtime_manifest_identity")
+        if (
+            manifest.get("schema_version") != 1
+            or not isinstance(identity, dict)
+            or identity.get("model_version") != version
+            or identity.get("artifact_digest") != checksum
+            or manifest.get("runtime_manifest_digest")
+            != identity.get("manifest_digest")
+            or manifest.get("model_file") != EVALUATION_MODEL_FILE
+            or manifest.get("checkpoint_file") != "checkpoint.pt"
+            or manifest.get("artifact_digest") != checksum
+            or "run_id" in manifest
+        ):
+            raise RuntimeFailure(
+                f"archive v{version} identity is invalid"
+            )
+        for field in ("artifact_digest", "manifest_digest"):
+            if re.fullmatch(
+                r"[0-9a-f]{64}", str(identity.get(field, ""))
+            ) is None:
+                raise RuntimeFailure(
+                    f"archive v{version} identity is invalid"
+                )
+        if not identity.get("model_lineage_id"):
+            raise RuntimeFailure(
+                f"archive v{version} identity is invalid"
+            )
+        return identity
+
     def _load_events(self) -> list[dict[str, Any]]:
         timeline_path = self.run_root / "timeline.json"
         if not timeline_path.is_file():
@@ -1238,6 +1309,7 @@ class DockerRuntime:
 
         identity_checksums: list[str] = []
         archive_manifests: dict[int, dict[str, Any]] = {}
+        archive_identities: dict[int, dict[str, Any]] = {}
         for version in (0, 2):
             version_dir = archive / f"{version:06d}"
             manifest_path = version_dir / "manifest.json"
@@ -1257,43 +1329,62 @@ class DockerRuntime:
                     f"training archive v{version} is incomplete"
                 )
             checksum = hashlib.sha256(model_path.read_bytes()).hexdigest()
-            if (
-                manifest.get("contract_version") != "0.6.0"
-                or manifest.get("model_version") != version
-                or manifest.get("model_file") != EVALUATION_MODEL_FILE
-                or manifest.get("checkpoint_file") != "checkpoint.pt"
-                or manifest.get("sha256") != checksum
-                or "run_id" in manifest
-            ):
-                raise RuntimeFailure(
-                    f"archive v{version} identity is invalid"
-                )
+            archive_identities[version] = self._archive_model_identity(
+                manifest, version=version, checksum=checksum
+            )
             archive_manifests[version] = manifest
             if version == 0:
                 identity_checksums.append(checksum)
 
         for version in (1, 2):
             receipt = receipts.get(version)
-            checksum = (receipt or {}).get("manifest", {}).get("sha256")
-            if not isinstance(checksum, str) or len(checksum) != 64:
+            identity = (receipt or {}).get("model")
+            if (
+                not isinstance(identity, dict)
+                or identity.get("model_version") != version
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(identity.get("artifact_digest", "")),
+                )
+                is None
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(identity.get("manifest_digest", "")),
+                )
+                is None
+                or not identity.get("model_lineage_id")
+            ):
                 raise RuntimeFailure(
                     f"model v{version} receipt identity is missing"
                 )
-            identity_checksums.append(checksum)
+            identity_checksums.append(identity["artifact_digest"])
         if len(set(identity_checksums)) != 3:
             raise RuntimeFailure("v0, v1, and v2 checksums must differ")
+        if (
+            archive_identities[2]["artifact_digest"]
+            != receipts[2]["model"]["artifact_digest"]
+        ):
+            raise RuntimeFailure("archive v2 and receipt identity differ")
 
         v2_receipt = receipts.get(2, {})
         v2_update_id = v2_receipt.get("train_update_id")
         if not v2_update_id:
             raise RuntimeFailure("model v2 update receipt is missing")
+        behavior_model = v2_receipt.get("behavior_model")
+        behavior_version = (
+            behavior_model.get("model_version")
+            if isinstance(behavior_model, dict)
+            else None
+        )
         if (
             v2_receipt.get("target_model_version") != 2
-            or v2_receipt.get("behavior_model_version") != 1
-            or not v2_receipt.get("archive_committed")
+            or not isinstance(behavior_version, int)
+            or isinstance(behavior_version, bool)
+            or behavior_version < 0
+            or (2 - 1 - behavior_version) not in range(0, 3)
         ):
             raise RuntimeFailure(
-                "model v2 receipt must ACK behavior model v1 samples"
+                "model v2 receipt has an invalid behavior policy lag"
             )
 
         retained_versions = list(
@@ -1315,15 +1406,15 @@ class DockerRuntime:
                 manifest_path.read_text(encoding="utf-8")
             )
             checksum = hashlib.sha256(model_path.read_bytes()).hexdigest()
-            if (
-                manifest.get("contract_version") != "0.6.0"
-                or manifest.get("model_version") != version
-                or manifest.get("sha256") != checksum
-                or not checkpoint_path.is_file()
-                or "run_id" in manifest
-            ):
+            self._runtime_model_identity(
+                manifest,
+                version=version,
+                checksum=checksum,
+                model_file=model_path.name,
+            )
+            if not checkpoint_path.is_file():
                 raise RuntimeFailure(
-                    f"runtime model v{version} identity is invalid"
+                    f"runtime model v{version} checkpoint is missing"
                 )
         if (published / "manifest_v000000.json").exists():
             raise RuntimeFailure("runtime v0 was not removed by retention")
@@ -1362,7 +1453,7 @@ class DockerRuntime:
             "archived_versions": [0, 2],
             "identity_checksums_v0_v1_v2": identity_checksums,
             "v2_train_update_id": v2_update_id,
-            "v2_behavior_model_version": 1,
+            "v2_behavior_model_version": behavior_version,
             "current_version": current_version,
         }
 
