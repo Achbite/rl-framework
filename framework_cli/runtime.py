@@ -18,6 +18,7 @@ from typing import Any
 from .spec import RunSpec
 
 EVALUATION_MODEL_FILE = "SaveModel.onnx"
+AISERVER_LOCAL_TEST_MODEL_DIR = "/opt/rl/aiserver/models/local-test"
 
 
 class RuntimeFailure(RuntimeError):
@@ -420,6 +421,48 @@ class DockerRuntime:
                 f"evaluation model does not exist: {model_path}"
             )
         return savepoint, model_path
+
+    @staticmethod
+    def _embedded_smoke_model_identity(
+        manifest: dict[str, Any], actual_checksum: str
+    ) -> tuple[str, dict[str, Any]]:
+        identity = manifest.get("identity")
+        model_file = manifest.get("model_file")
+        if (
+            manifest.get("manifest_schema_version") != 1
+            or manifest.get("package") != "rl-smoke-model"
+            or manifest.get("ready") is not True
+            or not isinstance(identity, dict)
+            or not isinstance(model_file, str)
+            or not model_file
+            or Path(model_file).name != model_file
+            or not model_file.endswith(".onnx")
+        ):
+            raise RuntimeFailure("embedded smoke model manifest is invalid")
+        artifact_digest = identity.get("artifact_digest")
+        model_version = identity.get("model_version")
+        lineage_id = identity.get("model_lineage_id")
+        if (
+            not isinstance(artifact_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", artifact_digest) is None
+            or not isinstance(model_version, int)
+            or isinstance(model_version, bool)
+            or model_version < 0
+            or not isinstance(lineage_id, str)
+            or not lineage_id
+            or actual_checksum != artifact_digest
+        ):
+            raise RuntimeFailure(
+                "embedded smoke model checksum or identity is invalid"
+            )
+        return model_file, {
+            "source": "embedded-smoke",
+            "package_version": manifest.get("version"),
+            "version": model_version,
+            "sha256": artifact_digest,
+            "seed": manifest.get("seed"),
+            "model_lineage_id": lineage_id,
+        }
 
     def _load_events(self) -> list[dict[str, Any]]:
         timeline_path = self.run_root / "timeline.json"
@@ -1649,29 +1692,28 @@ class DockerRuntime:
                     "exec",
                     self._name("aiserver"),
                     "cat",
-                    "/opt/rl/aiserver/models/smoke/manifest.json",
+                    f"{AISERVER_LOCAL_TEST_MODEL_DIR}/manifest.json",
                 ]
             )
             manifest = json.loads(manifest_result.stdout)
+            model_file = manifest.get("model_file")
+            if (
+                not isinstance(model_file, str)
+                or Path(model_file).name != model_file
+            ):
+                raise RuntimeFailure("embedded smoke model manifest is invalid")
             checksum_result = self._docker(
                 [
                     "exec",
                     self._name("aiserver"),
                     "sha256sum",
-                    "/opt/rl/aiserver/models/smoke/model_v000000.onnx",
+                    f"{AISERVER_LOCAL_TEST_MODEL_DIR}/{model_file}",
                 ]
             )
             actual_checksum = checksum_result.stdout.split()[0]
-            if actual_checksum != manifest.get("sha256"):
-                raise RuntimeFailure(
-                    "embedded smoke model checksum does not match its manifest"
-                )
-            model_identity = {
-                "source": "embedded-smoke",
-                "version": manifest.get("model_version"),
-                "sha256": actual_checksum,
-                "seed": manifest.get("seed"),
-            }
+            _, model_identity = self._embedded_smoke_model_identity(
+                manifest, actual_checksum
+            )
         self._record("aiserver_ready")
         self._atomic_json(
             replay_dir / "validation-manifest.json",

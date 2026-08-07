@@ -94,6 +94,54 @@ class RuntimePortTransportTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "SaveModel.onnx"):
             DockerRuntime._resolve_evaluation_model(str(wrong_name))
 
+    def test_embedded_smoke_model_uses_canonical_manifest_identity(self):
+        checksum = "a" * 64
+        manifest = {
+            "manifest_schema_version": 1,
+            "package": "rl-smoke-model",
+            "version": "0.10.0",
+            "ready": True,
+            "model_file": "model_v000000.onnx",
+            "seed": 0,
+            "identity": {
+                "artifact_digest": checksum,
+                "manifest_digest": "b" * 64,
+                "model_lineage_id": "maze-fixed-map-seed-0",
+                "model_version": 0,
+            },
+        }
+
+        model_file, identity = DockerRuntime._embedded_smoke_model_identity(
+            manifest, checksum
+        )
+
+        self.assertEqual(model_file, "model_v000000.onnx")
+        self.assertEqual(identity["package_version"], "0.10.0")
+        self.assertEqual(identity["version"], 0)
+        self.assertEqual(identity["sha256"], checksum)
+        self.assertEqual(
+            identity["model_lineage_id"], "maze-fixed-map-seed-0"
+        )
+
+        legacy = dict(manifest)
+        legacy.pop("identity")
+        legacy["sha256"] = checksum
+        legacy["model_version"] = 0
+        with self.assertRaisesRegex(Exception, "manifest is invalid"):
+            DockerRuntime._embedded_smoke_model_identity(legacy, checksum)
+
+        traversal = dict(manifest)
+        traversal["model_file"] = "../model_v000000.onnx"
+        with self.assertRaisesRegex(Exception, "manifest is invalid"):
+            DockerRuntime._embedded_smoke_model_identity(
+                traversal, checksum
+            )
+
+        with self.assertRaisesRegex(Exception, "checksum or identity"):
+            DockerRuntime._embedded_smoke_model_identity(
+                manifest, "c" * 64
+            )
+
     def test_learner_monitor_transport_requires_same_current_instance(self):
         status = {
             "schema_version": 1,
