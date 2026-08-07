@@ -19,6 +19,8 @@ from .spec import RunSpec
 
 EVALUATION_MODEL_FILE = "SaveModel.onnx"
 AISERVER_LOCAL_TEST_MODEL_DIR = "/opt/rl/aiserver/models/local-test"
+LEARNER_FINALIZE_REQUEST = "/tmp/rl-training-finalize"
+LEARNER_FINALIZE_COMPLETE = "/tmp/rl-training-finalized"
 
 
 class RuntimeFailure(RuntimeError):
@@ -323,6 +325,9 @@ def training_completion_status(
         "learner_run_trained": integer(learner, "run_trained_samples", -1),
         "learner_run_updates": integer(learner, "run_train_updates", -1),
         "train_batch_size": integer(learner, "train_batch_size", -1),
+        "max_train_batch_size": integer(
+            learner, "max_train_batch_size", -1
+        ),
         "initial_model_version": integer(
             learner, "initial_model_version", -1
         ),
@@ -367,16 +372,24 @@ def training_completion_status(
     ):
         reasons.append("ack_disposition_conservation_mismatch")
 
-    batch_size = counts["train_batch_size"]
-    expected_updates = (
-        expected_samples // batch_size
-        if batch_size > 0 and expected_samples % batch_size == 0
-        else -1
-    )
-    counts["expected_updates"] = expected_updates
-    if expected_updates < 0:
-        reasons.append("expected_samples_not_divisible_by_train_batch")
-    if counts["learner_run_updates"] != expected_updates:
+    target_batch = counts["train_batch_size"]
+    max_batch = counts["max_train_batch_size"]
+    if target_batch <= 0 or max_batch < target_batch:
+        minimum_updates = maximum_updates = -1
+        reasons.append("bounded_batch_contract_invalid")
+    else:
+        minimum_updates = (expected_samples + max_batch - 1) // max_batch
+        maximum_updates = (
+            expected_samples + target_batch - 1
+        ) // target_batch
+    counts["expected_updates_min"] = minimum_updates
+    counts["expected_updates_max"] = maximum_updates
+    if not (
+        minimum_updates >= 0
+        and minimum_updates
+        <= counts["learner_run_updates"]
+        <= maximum_updates
+    ):
         reasons.append("learner_run_update_count_mismatch")
     if counts["learner_run_trained"] != expected_samples:
         reasons.append("learner_run_trained_count_mismatch")
@@ -1271,6 +1284,82 @@ class DockerRuntime:
             f"training loop timeout; expected={expected}, last={last_record}"
         )
 
+    def _request_training_finalize(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        expected = self.spec.expected_samples
+        url = "http://127.0.0.1:9005/api/metrics/latest"
+        last_record: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            self._require_running("learner")
+            self._require_running("aiserver")
+            try:
+                payload = self._http_json(url)
+                last_record = payload.get("record", {})
+            except RuntimeFailure:
+                time.sleep(0.2)
+                continue
+            actor = last_record.get("actor", {})
+            distributor = last_record.get("distributor", {})
+            produced = int(actor.get("produced", -1))
+            actor_accepted = int(actor.get("accepted", -1))
+            pool_accepted = int(distributor.get("accepted", -1))
+            outbound = int(actor.get("outbound_pending", -1))
+            final_drop = int(actor.get("final_drop", -1))
+            if any(
+                value > expected
+                for value in (produced, actor_accepted, pool_accepted)
+            ) or final_drop > 0:
+                raise RuntimeFailure(
+                    "producer completion exceeded its finite Run contract"
+                )
+            if (
+                produced == expected
+                and actor_accepted == expected
+                and pool_accepted == expected
+                and outbound == 0
+                and final_drop == 0
+            ):
+                break
+            time.sleep(0.2)
+        else:
+            raise RuntimeFailure(
+                "producer did not flush the finite Run before final drain: "
+                f"{last_record}"
+            )
+
+        request = self._docker(
+            [
+                "exec",
+                self._name("learner"),
+                "touch",
+                LEARNER_FINALIZE_REQUEST,
+            ],
+            check=False,
+        )
+        if request.returncode != 0:
+            detail = request.stderr.strip() or request.stdout.strip()
+            raise RuntimeFailure(
+                f"Learner finalize request failed: {detail}"
+            )
+        self._record("training_finalize_requested")
+        while time.monotonic() < deadline:
+            self._require_running("learner")
+            marker = self._docker(
+                [
+                    "exec",
+                    self._name("learner"),
+                    "test",
+                    "-f",
+                    LEARNER_FINALIZE_COMPLETE,
+                ],
+                check=False,
+            )
+            if marker.returncode == 0:
+                self._record("training_finalize_complete")
+                return
+            time.sleep(0.2)
+        raise RuntimeFailure("Learner final sample drain timed out")
+
     def _wait_training_ready(
         self, minimum_timestamp: float, timeout: float
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1391,26 +1480,98 @@ class DockerRuntime:
         ):
             raise RuntimeFailure("archive v2 and receipt identity differ")
 
-        v2_receipt = receipts.get(2, {})
+        def behavior_version_range(
+            receipt: dict[str, Any], *, target_version: int
+        ) -> tuple[int, int]:
+            behavior = receipt.get("behavior_model")
+            models = (
+                behavior.get("models")
+                if isinstance(behavior, dict)
+                else None
+            )
+            minimum = (
+                behavior.get("minimum_model_version")
+                if isinstance(behavior, dict)
+                else None
+            )
+            maximum = (
+                behavior.get("maximum_model_version")
+                if isinstance(behavior, dict)
+                else None
+            )
+            target_identity = receipt.get("model")
+            if (
+                receipt.get("target_model_version") != target_version
+                or not isinstance(target_identity, dict)
+                or not isinstance(behavior, dict)
+                or not isinstance(models, list)
+                or not models
+                or not isinstance(minimum, int)
+                or isinstance(minimum, bool)
+                or not isinstance(maximum, int)
+                or isinstance(maximum, bool)
+            ):
+                raise RuntimeFailure(
+                    f"model v{target_version} behavior identity is invalid"
+                )
+
+            versions: list[int] = []
+            for identity in models:
+                version = (
+                    identity.get("model_version")
+                    if isinstance(identity, dict)
+                    else None
+                )
+                if (
+                    not isinstance(identity, dict)
+                    or not isinstance(version, int)
+                    or isinstance(version, bool)
+                    or version < 0
+                    or identity.get("model_lineage_id")
+                    != behavior.get("model_lineage_id")
+                    or identity.get("model_lineage_id")
+                    != target_identity.get("model_lineage_id")
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(identity.get("artifact_digest", "")),
+                    )
+                    is None
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(identity.get("manifest_digest", "")),
+                    )
+                    is None
+                ):
+                    raise RuntimeFailure(
+                        f"model v{target_version} behavior identity is invalid"
+                    )
+                versions.append(version)
+
+            reference_version = target_version - 1
+            if (
+                len(versions) != len(set(versions))
+                or minimum != min(versions)
+                or maximum != max(versions)
+                or minimum < 0
+                or maximum > reference_version
+                or reference_version - minimum > 2
+            ):
+                raise RuntimeFailure(
+                    f"model v{target_version} receipt has an invalid "
+                    "behavior policy range"
+                )
+            return minimum, maximum
+
+        behavior_ranges = {
+            version: behavior_version_range(
+                receipts[version], target_version=version
+            )
+            for version in (1, 2)
+        }
+        v2_receipt = receipts[2]
         v2_update_id = v2_receipt.get("train_update_id")
         if not v2_update_id:
             raise RuntimeFailure("model v2 update receipt is missing")
-        behavior_model = v2_receipt.get("behavior_model")
-        behavior_version = (
-            behavior_model.get("model_version")
-            if isinstance(behavior_model, dict)
-            else None
-        )
-        if (
-            v2_receipt.get("target_model_version") != 2
-            or not isinstance(behavior_version, int)
-            or isinstance(behavior_version, bool)
-            or behavior_version < 0
-            or (2 - 1 - behavior_version) not in range(0, 3)
-        ):
-            raise RuntimeFailure(
-                "model v2 receipt has an invalid behavior policy lag"
-            )
 
         retained_versions = list(
             range(max(0, current_version - 1), current_version + 1)
@@ -1478,7 +1639,7 @@ class DockerRuntime:
             "archived_versions": [0, 2],
             "identity_checksums_v0_v1_v2": identity_checksums,
             "v2_train_update_id": v2_update_id,
-            "v2_behavior_model_version": behavior_version,
+            "v2_behavior_model_version_range": list(behavior_ranges[2]),
             "current_version": current_version,
         }
 
@@ -1700,6 +1861,8 @@ class DockerRuntime:
                 f"{logs.stderr.strip() or logs.stdout.strip()}"
             )
         self._record("client_completed")
+
+        self._request_training_finalize(90)
 
         metrics = self._wait_metrics(180)
         current_version = int(metrics["learner"]["model_version"])

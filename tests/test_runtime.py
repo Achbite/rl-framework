@@ -372,9 +372,16 @@ class RuntimePortTransportTest(unittest.TestCase):
                         "target_model_version": version,
                         "behavior_model": {
                             "model_lineage_id": "maze-fixed-map-seed-0",
-                            "model_version": 0,
-                            "artifact_digest": "d" * 64,
-                            "manifest_digest": "e" * 64,
+                            "minimum_model_version": version - 1,
+                            "maximum_model_version": version - 1,
+                            "models": [
+                                {
+                                    "model_lineage_id": "maze-fixed-map-seed-0",
+                                    "model_version": version - 1,
+                                    "artifact_digest": "d" * 64,
+                                    "manifest_digest": "e" * 64,
+                                }
+                            ],
                         },
                         "train_update_id": f"update-{version}",
                         "model": {
@@ -437,7 +444,7 @@ class RuntimePortTransportTest(unittest.TestCase):
 
         self.assertEqual(result["archived_versions"], [0, 2])
         self.assertEqual(result["runtime_versions"], [1, 2])
-        self.assertEqual(result["v2_behavior_model_version"], 0)
+        self.assertEqual(result["v2_behavior_model_version_range"], [1, 1])
 
     def test_tunnel_socket_is_short_and_stable(self):
         runtime = DockerRuntime(self.spec)
@@ -687,6 +694,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                 "run_train_updates": 6,
                 "run_trained_samples": 3072,
                 "train_batch_size": 512,
+                "max_train_batch_size": 639,
             },
         }
         with (
@@ -710,6 +718,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                 return_value=(metrics, {"ready": True, "reasons": []}),
             ),
             mock.patch.object(runtime, "_wait_container_exit", return_value=0),
+            mock.patch.object(runtime, "_request_training_finalize"),
             mock.patch.object(runtime, "_wait_metrics", return_value=metrics),
             mock.patch.object(
                 runtime,
@@ -777,6 +786,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                 "run_train_updates": 2,
                 "run_trained_samples": 1024,
                 "train_batch_size": 512,
+                "max_train_batch_size": 639,
             },
         }
 
@@ -813,12 +823,93 @@ class RuntimePortTransportTest(unittest.TestCase):
                 "run_train_updates": 6,
                 "run_trained_samples": 3072,
                 "train_batch_size": 512,
+                "max_train_batch_size": 639,
             },
         }
 
         completion = training_completion_status(record, 3072)
 
         self.assertTrue(completion["complete"], completion["reasons"])
+
+    def test_completion_accepts_bounded_whole_fragment_update_count(self):
+        record = {
+            "actor": {
+                "produced": 3072,
+                "outbound_pending": 0,
+                "final_drop": 0,
+            },
+            "distributor": {
+                "accepted": 3072,
+                "acked": 3072,
+                "ready_samples": 0,
+                "leased_samples": 0,
+                "trained": 3072,
+                "stale": 0,
+                "invalid": 0,
+                "shutdown_untrained": 0,
+            },
+            "learner": {
+                "model_version": 5,
+                "initial_model_version": 0,
+                "run_train_updates": 5,
+                "run_trained_samples": 3072,
+                "train_batch_size": 512,
+                "max_train_batch_size": 639,
+            },
+        }
+
+        completion = training_completion_status(record, 3072)
+
+        self.assertTrue(completion["complete"], completion["reasons"])
+        self.assertEqual(completion["counts"]["expected_updates_min"], 5)
+        self.assertEqual(completion["counts"]["expected_updates_max"], 6)
+
+    def test_framework_requests_final_drain_only_after_producer_flush(self):
+        runtime = DockerRuntime(self.spec)
+        record = {
+            "actor": {
+                "produced": 3072,
+                "accepted": 3072,
+                "outbound_pending": 0,
+                "final_drop": 0,
+            },
+            "distributor": {"accepted": 3072},
+        }
+        docker_results = [
+            mock.Mock(returncode=0, stdout="", stderr=""),
+            mock.Mock(returncode=0, stdout="", stderr=""),
+        ]
+        events = []
+        with (
+            mock.patch.object(runtime, "_require_running"),
+            mock.patch.object(
+                runtime,
+                "_http_json",
+                return_value={"record": record},
+            ),
+            mock.patch.object(
+                runtime, "_docker", side_effect=docker_results
+            ) as docker,
+            mock.patch.object(
+                runtime,
+                "_record",
+                side_effect=lambda state, detail="": events.append(state),
+            ),
+        ):
+            runtime._request_training_finalize(1)
+
+        self.assertEqual(
+            docker.call_args_list[0].args[0][-1],
+            "/tmp/rl-training-finalize",
+        )
+        self.assertEqual(
+            docker.call_args_list[1].args[0][-1],
+            "/tmp/rl-training-finalized",
+        )
+        self.assertEqual(
+            events,
+            ["training_finalize_requested", "training_finalize_complete"],
+        )
 
     def test_platform_training_start_returns_after_chain_readiness(self):
         runtime = DockerRuntime(self.spec)
