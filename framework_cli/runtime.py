@@ -1573,9 +1573,6 @@ class DockerRuntime:
         monitor_transport = self._ensure_host_port(
             9005, 180, record_transport=False
         )
-        self._wait_learner_monitor_transport(launch_started_at, 15)
-        self._record_port_transport(9005, monitor_transport)
-        self._record("learner_pod_ready")
 
         self._run_container(
             "aiserver",
@@ -1601,6 +1598,9 @@ class DockerRuntime:
         )
         self._wait_healthy("aiserver", 60)
         self._record("model_v0_loaded_ack")
+        self._wait_learner_monitor_transport(launch_started_at, 15)
+        self._record_port_transport(9005, monitor_transport)
+        self._record("learner_pod_ready")
         self._record("aiserver_ready")
 
         self._run_container(

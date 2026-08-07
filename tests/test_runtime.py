@@ -635,13 +635,19 @@ class RuntimePortTransportTest(unittest.TestCase):
     def test_training_exposes_only_metrics_and_uses_internal_data_plane(self):
         runtime = DockerRuntime(self.spec, runtime_scope="local-tests")
         started = {}
+        timeline = []
 
         def record_container(role, image_ref, arguments):
+            timeline.append(f"start:{role}")
             started[role] = {
                 "image_ref": image_ref,
                 "arguments": arguments,
             }
             return f"{role}-id"
+
+        def record_monitor(*_args, **_kwargs):
+            timeline.append("monitor:semantic")
+            return {"ready": True, "reasons": []}
 
         metrics = {
             "actor": {
@@ -683,7 +689,7 @@ class RuntimePortTransportTest(unittest.TestCase):
             mock.patch.object(
                 runtime,
                 "_wait_learner_monitor_transport",
-                return_value={"ready": True, "reasons": []},
+                side_effect=record_monitor,
             ),
             mock.patch.object(
                 runtime,
@@ -721,6 +727,10 @@ class RuntimePortTransportTest(unittest.TestCase):
         self.assertNotIn("MAZE_", client_args)
         self.assertIn("RL_AISERVER_HOST=maze-aiserver", client_args)
         self.assertNotIn("9004", client_args)
+        self.assertLess(
+            timeline.index("start:aiserver"),
+            timeline.index("monitor:semantic"),
+        )
         self.assertEqual(
             result["ports"], {"learner_metrics": 9005}
         )
