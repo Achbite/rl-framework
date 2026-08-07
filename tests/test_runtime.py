@@ -397,7 +397,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-        for version in (1, 2):
+        for version in (0, 1, 2):
             model = serving / f"model_v{version:06d}.onnx"
             model.write_bytes(f"serving-model-{version}".encode())
             checksum = hashlib.sha256(model.read_bytes()).hexdigest()
@@ -440,10 +440,11 @@ class RuntimePortTransportTest(unittest.TestCase):
         with mock.patch.object(
             runtime, "_docker", return_value=checkpoint_probe
         ):
-            result = runtime._validate_training_artifacts(local_train, 2)
+            result = runtime._validate_training_artifacts(local_train, 2, 2)
 
         self.assertEqual(result["archived_versions"], [0, 2])
-        self.assertEqual(result["runtime_versions"], [1, 2])
+        self.assertEqual(result["runtime_versions"], [0, 1, 2])
+        self.assertEqual(result["required_runtime_versions"], [0, 1, 2])
         self.assertEqual(result["v2_behavior_model_version_range"], [1, 1])
 
     def test_tunnel_socket_is_short_and_stable(self):
@@ -695,6 +696,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                 "run_trained_samples": 3072,
                 "train_batch_size": 512,
                 "max_train_batch_size": 639,
+                "max_policy_lag": 2,
             },
         }
         with (

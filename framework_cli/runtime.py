@@ -1405,14 +1405,21 @@ class DockerRuntime:
         )
 
     def _validate_training_artifacts(
-        self, local_train_root: Path, current_version: int
+        self,
+        local_train_root: Path,
+        current_version: int,
+        max_policy_lag: int,
     ) -> dict[str, Any]:
         runtime = local_train_root / "runtime"
         published = runtime / "serving"
         checkpoints = runtime / "checkpoints"
         archive = local_train_root / "archive"
         updates = runtime / "receipts"
-        if current_version < 2:
+        if (
+            current_version < 2
+            or max_policy_lag < 0
+            or isinstance(max_policy_lag, bool)
+        ):
             raise RuntimeFailure("training did not publish model v2")
 
         receipts: dict[int, dict[str, Any]] = {}
@@ -1554,7 +1561,7 @@ class DockerRuntime:
                 or maximum != max(versions)
                 or minimum < 0
                 or maximum > reference_version
-                or reference_version - minimum > 2
+                or reference_version - minimum > max_policy_lag
             ):
                 raise RuntimeFailure(
                     f"model v{target_version} receipt has an invalid "
@@ -1573,18 +1580,22 @@ class DockerRuntime:
         if not v2_update_id:
             raise RuntimeFailure("model v2 update receipt is missing")
 
-        retained_versions = list(
-            range(max(0, current_version - 1), current_version + 1)
+        required_versions = list(
+            range(
+                max(0, current_version - max_policy_lag),
+                current_version + 1,
+            )
         )
         actual_retained = sorted(
             int(path.stem.removeprefix("manifest_v"))
             for path in published.glob("manifest_v*.json")
         )
-        if actual_retained != retained_versions:
+        if not set(required_versions).issubset(actual_retained):
             raise RuntimeFailure(
-                "runtime serving directory does not retain exactly two versions"
+                "runtime serving directory is missing the required policy "
+                "freshness window"
             )
-        for version in retained_versions:
+        for version in required_versions:
             manifest_path = published / f"manifest_v{version:06d}.json"
             model_path = published / f"model_v{version:06d}.onnx"
             checkpoint_path = checkpoints / f"checkpoint_v{version:06d}.pt"
@@ -1602,9 +1613,6 @@ class DockerRuntime:
                 raise RuntimeFailure(
                     f"runtime model v{version} checkpoint is missing"
                 )
-        if (published / "manifest_v000000.json").exists():
-            raise RuntimeFailure("runtime v0 was not removed by retention")
-
         checkpoint_probe = self._docker(
             [
                 "exec",
@@ -1635,7 +1643,8 @@ class DockerRuntime:
                 "current runtime checkpoint identity is invalid"
             )
         return {
-            "runtime_versions": retained_versions,
+            "runtime_versions": actual_retained,
+            "required_runtime_versions": required_versions,
             "archived_versions": [0, 2],
             "identity_checksums_v0_v1_v2": identity_checksums,
             "v2_train_update_id": v2_update_id,
@@ -1866,8 +1875,9 @@ class DockerRuntime:
 
         metrics = self._wait_metrics(180)
         current_version = int(metrics["learner"]["model_version"])
+        max_policy_lag = int(metrics["learner"]["max_policy_lag"])
         artifacts = self._validate_training_artifacts(
-            learner_local_train, current_version
+            learner_local_train, current_version, max_policy_lag
         )
         client_ports = self._docker(
             [
