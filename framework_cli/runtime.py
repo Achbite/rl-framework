@@ -1380,13 +1380,11 @@ class DockerRuntime:
     def _base_env(self) -> list[str]:
         return [
             "--env",
-            "MAZE_AISERVER_ID=aiserver-0",
+            "RL_AISERVER_ID=aiserver-0",
             "--env",
-            "MAZE_CLIENT_ID=client-0",
+            "RL_CLIENT_INSTANCE_ID=maze-client-0",
             "--env",
-            "MAZE_ENV_ID=env-0",
-            "--env",
-            "MAZE_SESSION_ID=0",
+            "RL_ENVIRONMENT_INSTANCE_ID=maze-env-0",
         ]
 
     def start(self, *, wait_for_completion: bool = False) -> dict[str, Any]:
@@ -1439,11 +1437,11 @@ class DockerRuntime:
         learner_arguments = [
             *self._base_env(),
             "--env",
-            "MAZE_LEARNER_ID=learner-0",
+            "RL_LEARNER_INSTANCE=learner-0",
             "--env",
-            "MAZE_AISERVER_HOST=maze-aiserver",
+            "RL_AISERVER_HOST=maze-aiserver",
             "--env",
-            "MAZE_LOCAL_TRAIN_ROOT=/opt/rl/learner/models/local-train",
+            "RL_LOCAL_TRAIN_ROOT=/opt/rl/learner/models/local-train",
             "--publish",
             "127.0.0.1:9005:9005",
             "--volume",
@@ -1456,7 +1454,7 @@ class DockerRuntime:
         ]
         if self.runtime_scope == "local-tests":
             learner_arguments.extend(
-                ["--env", "MAZE_ARCHIVE_INTERVAL_UPDATES=2"]
+                ["--env", "RL_ARCHIVE_INTERVAL_UPDATES=2"]
             )
         if self.spec.initial_checkpoint:
             checkpoint = Path(self.spec.initial_checkpoint)
@@ -1472,7 +1470,7 @@ class DockerRuntime:
                         "/opt/rl/learner/initial-checkpoint:ro"
                     ),
                     "--env",
-                    f"MAZE_INITIAL_CHECKPOINT={container_checkpoint}",
+                    f"RL_INITIAL_CHECKPOINT={container_checkpoint}",
                 ]
             )
         self._run_container(
@@ -1494,11 +1492,13 @@ class DockerRuntime:
             [
                 *self._base_env(),
                 "--env",
-                "MAZE_MODEL_DISTRIBUTOR_HOST=maze-learner",
+                "RL_MODEL_DISTRIBUTOR_HOST=maze-learner",
                 "--env",
-                "MAZE_SAMPLE_DISTRIBUTOR_HOST=maze-learner",
+                "RL_SAMPLE_DISTRIBUTOR_HOST=maze-learner",
                 "--env",
-                "MAZE_LOCAL_TRAIN_ROOT=/opt/rl/aiserver/models/local-train",
+                "RL_LOCAL_TRAIN_ROOT=/opt/rl/aiserver/models/local-train",
+                "--env",
+                f"RL_TRAINING_SAMPLE_BUDGET={self.spec.expected_samples}",
                 "--volume",
                 f"{aiserver_logs}:/opt/rl/aiserver/log",
                 "--volume",
@@ -1518,13 +1518,7 @@ class DockerRuntime:
             [
                 *self._base_env(),
                 "--env",
-                "MAZE_AISERVER_HOST=maze-aiserver",
-                "--env",
-                f"MAZE_AGENT_NUM={self.spec.agents}",
-                "--env",
-                f"MAZE_MAX_EPISODES={self.spec.episodes}",
-                "--env",
-                f"MAZE_MAX_STEPS={self.spec.max_steps}",
+                "RL_AISERVER_HOST=maze-aiserver",
                 "--volume",
                 f"{client_logs}:/opt/rl/maze-client/log",
             ],
@@ -1736,17 +1730,13 @@ class DockerRuntime:
             [
                 *self._base_env(),
                 "--env",
-                "MAZE_VALIDATION_RESULT_PATH=/opt/rl/maze-client/replays/client-result.json",
+                "RL_VALIDATION_RESULT_PATH=/opt/rl/maze-client/replays/client-result.json",
                 "--env",
-                "MAZE_AISERVER_HOST=maze-aiserver",
+                "RL_AISERVER_HOST=maze-aiserver",
                 "--env",
-                f"MAZE_AGENT_NUM={self.spec.agents}",
+                f"RL_VALIDATION_ID={self.spec.run_id}",
                 "--env",
-                f"MAZE_MAX_EPISODES={self.spec.episodes}",
-                "--env",
-                f"MAZE_MAX_STEPS={self.spec.max_steps}",
-                "--env",
-                "MAZE_VIZ_OUTPUT_DIR=/opt/rl/maze-client/replays",
+                "RL_VIZ_OUTPUT_DIR=/opt/rl/maze-client/replays",
                 "--publish",
                 "127.0.0.1:9004:9004",
                 "--volume",

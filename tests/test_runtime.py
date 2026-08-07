@@ -456,8 +456,12 @@ class RuntimePortTransportTest(unittest.TestCase):
     def test_component_environment_excludes_platform_run_identity(self):
         runtime = DockerRuntime(self.spec)
         environment = runtime._base_env()
-        self.assertNotIn("MAZE_RUN_ID", " ".join(environment))
-        self.assertNotIn(self.spec.run_id, " ".join(environment))
+        joined = " ".join(environment)
+        self.assertNotIn("MAZE_", joined)
+        self.assertNotIn("RL_RUN_ID", joined)
+        self.assertNotIn(self.spec.run_id, joined)
+        self.assertIn("RL_AISERVER_ID=aiserver-0", joined)
+        self.assertIn("RL_CLIENT_INSTANCE_ID=maze-client-0", joined)
 
     def test_container_uses_runspec_image_command_and_resources(self):
         runtime = DockerRuntime(self.spec)
@@ -676,11 +680,13 @@ class RuntimePortTransportTest(unittest.TestCase):
         self.assertIn("127.0.0.1:9005:9005", learner_args)
         self.assertNotIn("127.0.0.1:9200:9200", learner_args)
         self.assertIn(
-            "MAZE_SAMPLE_DISTRIBUTOR_HOST=maze-learner",
+            "RL_SAMPLE_DISTRIBUTOR_HOST=maze-learner",
             aiserver_args,
         )
+        self.assertIn("RL_TRAINING_SAMPLE_BUDGET=3072", aiserver_args)
         self.assertNotIn("--publish", started["aiserver"]["arguments"])
-        self.assertNotIn("MAZE_WORKLOAD", client_args)
+        self.assertNotIn("MAZE_", client_args)
+        self.assertIn("RL_AISERVER_HOST=maze-aiserver", client_args)
         self.assertNotIn("9004", client_args)
         self.assertEqual(
             result["ports"], {"learner_metrics": 9005}
