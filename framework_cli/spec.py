@@ -77,10 +77,6 @@ class RunSpec:
     initial_checkpoint: str | None
     source_path: Path
 
-    @property
-    def expected_samples(self) -> int:
-        return self.agents * self.episodes * self.max_steps
-
     def image_ref(self, role: str) -> str:
         return self.components[role].image_ref
 
@@ -188,6 +184,32 @@ def load_run_spec(path: str) -> RunSpec:
         role: _load_component(role, components_document.get(role))
         for role in ROLE_NAMES
     }
+    aiserver_args = components["aiserver"].args
+    if not aiserver_args or aiserver_args[0] != mode:
+        raise SpecError(
+            "components.aiserver.args must start with the RunSpec mode"
+        )
+    reserved_workload_tokens = {
+        *MODES,
+        *MODE_ALIASES,
+        "--workload",
+        "--train",
+    }
+    conflicting_aiserver_args = [
+        argument
+        for argument in aiserver_args[1:]
+        if argument in reserved_workload_tokens
+    ]
+    if conflicting_aiserver_args:
+        raise SpecError(
+            "components.aiserver.args cannot override the RunSpec mode"
+        )
+    if mode == "training":
+        learner_args = components["learner"].args
+        if not learner_args or learner_args[0] != "training":
+            raise SpecError(
+                "training requires components.learner.args to start with training"
+            )
 
     placement = document.get("placement")
     if not isinstance(placement, dict):

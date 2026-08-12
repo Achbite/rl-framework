@@ -66,9 +66,9 @@ class RunSpecTest(unittest.TestCase):
             },
         }
 
-    def test_training_expected_samples(self):
+    def test_training_has_no_derived_sample_budget(self):
         spec = load_run_spec(str(self.write(self.baseline())))
-        self.assertEqual(spec.expected_samples, 3072)
+        self.assertFalse(hasattr(spec, "expected_samples"))
         self.assertEqual(
             spec.image_ref("learner"), "rl-training/learner:training-001"
         )
@@ -85,6 +85,37 @@ class RunSpecTest(unittest.TestCase):
         with self.assertRaises(SpecError):
             load_run_spec(str(self.write(document)))
 
+    def test_component_workloads_must_match_run_spec(self):
+        document = self.baseline()
+        document["components"]["aiserver"]["args"] = [
+            "model-evaluation"
+        ]
+        with self.assertRaisesRegex(
+            SpecError, "aiserver.args must start with the RunSpec mode"
+        ):
+            load_run_spec(str(self.write(document)))
+
+        document = self.baseline()
+        document["components"]["learner"]["args"] = ["local-test"]
+        with self.assertRaisesRegex(
+            SpecError, "learner.args to start with training"
+        ):
+            load_run_spec(str(self.write(document)))
+
+    def test_aiserver_workload_cannot_be_overridden_later(self):
+        for arguments in (
+            ["training", "--workload", "model-evaluation"],
+            ["training", "--train"],
+            ["training", "model-evaluation"],
+        ):
+            with self.subTest(arguments=arguments):
+                document = self.baseline()
+                document["components"]["aiserver"]["args"] = arguments
+                with self.assertRaisesRegex(
+                    SpecError, "cannot override the RunSpec mode"
+                ):
+                    load_run_spec(str(self.write(document)))
+
     def test_initial_checkpoint_is_explicit_and_training_only(self):
         document = self.baseline()
         document["initial_checkpoint"] = "/tmp/checkpoint.pt"
@@ -95,6 +126,7 @@ class RunSpecTest(unittest.TestCase):
         )
 
         document["mode"] = "local-test"
+        document["components"]["aiserver"]["args"] = ["local-test"]
         with self.assertRaisesRegex(
             SpecError, "supported only for training"
         ):
@@ -158,6 +190,7 @@ class RunSpecTest(unittest.TestCase):
     def test_legacy_inference_smoke_mode_reads_as_local_test(self):
         document = self.baseline()
         document["mode"] = "inference-smoke"
+        document["components"]["aiserver"]["args"] = ["local-test"]
         spec = load_run_spec(str(self.write(document)))
         self.assertEqual(spec.mode, "local-test")
 

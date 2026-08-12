@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -9,8 +10,8 @@ from unittest import mock
 
 from framework_cli.runtime import (
     DockerRuntime,
+    RuntimeFailure,
     learner_monitor_transport_readiness,
-    training_completion_status,
     training_record_readiness,
 )
 from framework_cli.spec import ComponentSpec, ResourceSpec, RunSpec
@@ -318,8 +319,14 @@ class RuntimePortTransportTest(unittest.TestCase):
             source_mismatch["reasons"],
         )
 
-    def test_training_artifacts_use_fixed_savepoint_layout(self):
-        local_train = Path(self.workspace.name) / "learner-local-train"
+    def _write_training_artifact_fixture(
+        self,
+        local_train: Path,
+        initial_model_version: int,
+        run_updates: int = 2,
+    ) -> int:
+        current_version = initial_model_version + run_updates
+        second_update_version = initial_model_version + 2
         archive = local_train / "archive"
         serving = local_train / "runtime" / "serving"
         checkpoints = local_train / "runtime" / "checkpoints"
@@ -328,7 +335,7 @@ class RuntimePortTransportTest(unittest.TestCase):
             directory.mkdir(parents=True)
 
         archive_checksums = {}
-        for version in (0, 2):
+        for version in (initial_model_version, second_update_version):
             savepoint = archive / f"{version:06d}"
             savepoint.mkdir()
             model = savepoint / "SaveModel.onnx"
@@ -341,7 +348,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                 "model_version": version,
                 "artifact_digest": checksum,
                 "manifest_digest": hashlib.sha256(
-                    f"archive-manifest-{version}".encode()
+                    f"model-manifest-{version}".encode()
                 ).hexdigest(),
             }
             (savepoint / "manifest.json").write_text(
@@ -361,10 +368,16 @@ class RuntimePortTransportTest(unittest.TestCase):
             )
 
         receipt_checksums = {
-            1: hashlib.sha256(b"receipt-model-1").hexdigest(),
-            2: archive_checksums[2],
+            version: (
+                archive_checksums[second_update_version]
+                if version == second_update_version
+                else hashlib.sha256(
+                    f"receipt-model-{version}".encode()
+                ).hexdigest()
+            )
+            for version in range(initial_model_version + 1, current_version + 1)
         }
-        for version in (1, 2):
+        for version in range(initial_model_version + 1, current_version + 1):
             (receipts / f"update-{version}.json").write_text(
                 json.dumps(
                     {
@@ -389,7 +402,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                             "model_version": version,
                             "artifact_digest": receipt_checksums[version],
                             "manifest_digest": hashlib.sha256(
-                                f"receipt-manifest-{version}".encode()
+                                f"model-manifest-{version}".encode()
                             ).hexdigest(),
                         },
                     }
@@ -397,9 +410,15 @@ class RuntimePortTransportTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-        for version in (0, 1, 2):
+        for version in range(initial_model_version, current_version + 1):
             model = serving / f"model_v{version:06d}.onnx"
-            model.write_bytes(f"serving-model-{version}".encode())
+            model.write_bytes(
+                (
+                    f"archive-model-{version}"
+                    if version in archive_checksums
+                    else f"receipt-model-{version}"
+                ).encode()
+            )
             checksum = hashlib.sha256(model.read_bytes()).hexdigest()
             (serving / f"manifest_v{version:06d}.json").write_text(
                 json.dumps(
@@ -414,7 +433,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                             "model_version": version,
                             "artifact_digest": checksum,
                             "manifest_digest": hashlib.sha256(
-                                f"runtime-manifest-{version}".encode()
+                                f"model-manifest-{version}".encode()
                             ).hexdigest(),
                         },
                         "model_file": model.name,
@@ -426,26 +445,136 @@ class RuntimePortTransportTest(unittest.TestCase):
             (checkpoints / f"checkpoint_v{version:06d}.pt").write_bytes(
                 b"checkpoint"
             )
+        return current_version
+
+    def _validate_training_artifact_fixture(
+        self, *, initial_model_version: int, run_updates: int = 2
+    ) -> dict:
+        local_train = (
+            Path(self.workspace.name)
+            / f"learner-local-train-{initial_model_version}-{run_updates}"
+        )
+        current_version = self._write_training_artifact_fixture(
+            local_train, initial_model_version, run_updates
+        )
 
         runtime = DockerRuntime(self.spec)
         checkpoint_probe = mock.Mock(
             stdout=json.dumps(
                 {
-                    "version": 2,
+                    "version": current_version,
                     "optimizer": True,
-                    "update": "update-2",
+                    "update": f"update-{current_version}",
                 }
             )
         )
         with mock.patch.object(
             runtime, "_docker", return_value=checkpoint_probe
         ):
-            result = runtime._validate_training_artifacts(local_train, 2, 2)
+            return runtime._validate_training_artifacts(
+                local_train,
+                current_version,
+                2,
+                initial_model_version,
+            )
+
+    def test_training_artifacts_use_fixed_savepoint_layout(self):
+        result = self._validate_training_artifact_fixture(
+            initial_model_version=0
+        )
 
         self.assertEqual(result["archived_versions"], [0, 2])
         self.assertEqual(result["runtime_versions"], [0, 1, 2])
         self.assertEqual(result["required_runtime_versions"], [0, 1, 2])
+        self.assertEqual(
+            result["second_update_behavior_model_version_range"], [1, 1]
+        )
+        self.assertEqual(
+            result["identity_checksums_v0_v1_v2"],
+            result["identity_checksums_baseline_first_two_updates"],
+        )
+        self.assertEqual(result["v2_train_update_id"], "update-2")
         self.assertEqual(result["v2_behavior_model_version_range"], [1, 1])
+
+    def test_training_artifacts_use_checkpoint_publication_baseline(self):
+        result = self._validate_training_artifact_fixture(
+            initial_model_version=21
+        )
+
+        self.assertEqual(result["archived_versions"], [21, 23])
+        self.assertEqual(result["runtime_versions"], [21, 22, 23])
+        self.assertEqual(result["required_runtime_versions"], [21, 22, 23])
+        self.assertEqual(result["probe_versions"], [21, 22, 23])
+        self.assertEqual(
+            result["second_update_behavior_model_version_range"], [22, 22]
+        )
+        self.assertNotIn("identity_checksums_v0_v1_v2", result)
+        self.assertNotIn("v2_train_update_id", result)
+
+    def test_training_artifacts_do_not_require_current_archive(self):
+        result = self._validate_training_artifact_fixture(
+            initial_model_version=21,
+            run_updates=3,
+        )
+
+        self.assertEqual(result["archived_versions"], [21, 23])
+        self.assertEqual(result["runtime_versions"], [21, 22, 23, 24])
+        self.assertEqual(result["required_runtime_versions"], [22, 23, 24])
+        self.assertEqual(result["current_version"], 24)
+
+    def test_training_artifact_identity_chain_fails_closed(self):
+        cases = (
+            "second-archive-manifest",
+            "current-runtime-manifest",
+            "current-checkpoint-update",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                local_train = Path(self.workspace.name) / f"identity-{case}"
+                current_version = self._write_training_artifact_fixture(
+                    local_train, 21, 3
+                )
+                if case == "second-archive-manifest":
+                    path = local_train / "archive/000023/manifest.json"
+                    document = json.loads(path.read_text(encoding="utf-8"))
+                    document["runtime_manifest_identity"][
+                        "manifest_digest"
+                    ] = "f" * 64
+                    document["runtime_manifest_digest"] = "f" * 64
+                    path.write_text(json.dumps(document), encoding="utf-8")
+                elif case == "current-runtime-manifest":
+                    path = (
+                        local_train
+                        / "runtime/serving/manifest_v000024.json"
+                    )
+                    document = json.loads(path.read_text(encoding="utf-8"))
+                    document["identity"]["manifest_digest"] = "f" * 64
+                    path.write_text(json.dumps(document), encoding="utf-8")
+
+                checkpoint_update = (
+                    "wrong-update"
+                    if case == "current-checkpoint-update"
+                    else f"update-{current_version}"
+                )
+                checkpoint_probe = mock.Mock(
+                    stdout=json.dumps(
+                        {
+                            "version": current_version,
+                            "optimizer": True,
+                            "update": checkpoint_update,
+                        }
+                    )
+                )
+                runtime = DockerRuntime(self.spec)
+                with mock.patch.object(
+                    runtime, "_docker", return_value=checkpoint_probe
+                ), self.assertRaises(RuntimeFailure):
+                    runtime._validate_training_artifacts(
+                        local_train,
+                        current_version,
+                        2,
+                        21,
+                    )
 
     def test_tunnel_socket_is_short_and_stable(self):
         runtime = DockerRuntime(self.spec)
@@ -616,7 +745,7 @@ class RuntimePortTransportTest(unittest.TestCase):
             mock.patch.object(
                 runtime,
                 "_managed_containers",
-                return_value=list(roles),
+                side_effect=[list(roles), []],
             ),
             mock.patch.object(
                 runtime,
@@ -626,8 +755,8 @@ class RuntimePortTransportTest(unittest.TestCase):
             mock.patch.object(
                 runtime,
                 "_stop_and_remove",
-                side_effect=lambda container_id, timeout: events.append(
-                    ("stop", container_id, timeout)
+                side_effect=lambda container_id, timeout: (
+                    events.append(("stop", container_id, timeout)) or True
                 ),
             ),
             mock.patch.object(
@@ -638,7 +767,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                 ),
             ),
             mock.patch.object(runtime, "_stop_port_tunnels"),
-            mock.patch.object(runtime, "_remove_network"),
+            mock.patch.object(runtime, "_remove_network", return_value=True),
         ):
             runtime.stop_run()
 
@@ -646,29 +775,24 @@ class RuntimePortTransportTest(unittest.TestCase):
             events,
             [
                 ("stop", "client-id", 5),
-                ("quiesce", "aiserver-id", 20),
+                ("quiesce", "aiserver-id", 60),
                 ("quiesce", "learner-id", 130),
                 ("stop", "aiserver-id", 5),
                 ("stop", "learner-id", 5),
             ],
         )
 
-    def test_training_exposes_only_metrics_and_uses_internal_data_plane(self):
+    def test_training_is_unbounded_and_uses_only_internal_data_plane(self):
         runtime = DockerRuntime(self.spec, runtime_scope="local-tests")
         started = {}
-        timeline = []
+        healthy_roles = []
 
         def record_container(role, image_ref, arguments):
-            timeline.append(f"start:{role}")
             started[role] = {
                 "image_ref": image_ref,
                 "arguments": arguments,
             }
             return f"{role}-id"
-
-        def record_monitor(*_args, **_kwargs):
-            timeline.append("monitor:semantic")
-            return {"ready": True, "reasons": []}
 
         metrics = {
             "actor": {
@@ -703,215 +827,236 @@ class RuntimePortTransportTest(unittest.TestCase):
             mock.patch.object(
                 runtime, "_run_container", side_effect=record_container
             ),
-            mock.patch.object(runtime, "_wait_healthy"),
             mock.patch.object(
                 runtime,
-                "_ensure_host_port",
-                return_value="docker-publish",
-            ),
-            mock.patch.object(
-                runtime,
-                "_wait_learner_monitor_transport",
-                side_effect=record_monitor,
-            ),
-            mock.patch.object(
-                runtime,
-                "_wait_training_ready",
-                return_value=(metrics, {"ready": True, "reasons": []}),
-            ),
-            mock.patch.object(runtime, "_wait_container_exit", return_value=0),
-            mock.patch.object(runtime, "_request_training_finalize"),
-            mock.patch.object(runtime, "_wait_metrics", return_value=metrics),
-            mock.patch.object(
-                runtime,
-                "_validate_training_artifacts",
-                return_value={"current_version": 6},
-            ),
-            mock.patch.object(
-                runtime,
-                "_docker",
-                return_value=mock.Mock(
-                    returncode=0, stdout="{}", stderr=""
+                "_wait_healthy",
+                side_effect=lambda role, timeout: healthy_roles.append(
+                    (role, timeout)
                 ),
             ),
+            mock.patch.object(
+                runtime,
+                "_require_running",
+            ),
+            mock.patch.object(
+                runtime,
+                "_container_metrics_latest",
+                return_value=metrics,
+            ),
         ):
-            result = runtime._start_training(wait_for_completion=True)
+            result = runtime._start_training()
 
         learner_args = " ".join(started["learner"]["arguments"])
         aiserver_args = " ".join(started["aiserver"]["arguments"])
         client_args = " ".join(started["client"]["arguments"])
-        self.assertIn("127.0.0.1:9005:9005", learner_args)
+        self.assertNotIn("127.0.0.1:9005:9005", learner_args)
         self.assertNotIn("127.0.0.1:9200:9200", learner_args)
         self.assertIn(
             "RL_SAMPLE_DISTRIBUTOR_HOST=maze-learner",
             aiserver_args,
         )
-        self.assertIn("RL_TRAINING_SAMPLE_BUDGET=3072", aiserver_args)
+        self.assertNotIn("RL_TRAINING_SAMPLE_BUDGET", aiserver_args)
         self.assertNotIn("--publish", started["aiserver"]["arguments"])
         self.assertNotIn("MAZE_", client_args)
         self.assertIn("RL_AISERVER_HOST=maze-aiserver", client_args)
+        self.assertIn("RL_EXPECTED_WORKLOAD=training", client_args)
         self.assertNotIn("9004", client_args)
-        self.assertLess(
-            timeline.index("start:aiserver"),
-            timeline.index("monitor:semantic"),
-        )
-        self.assertEqual(
-            result["ports"], {"learner_metrics": 9005}
-        )
+        self.assertEqual(result["ports"], {})
         self.assertEqual(
             result["internal_ports"]["local_sample_service"], 9100
         )
+        self.assertIsNone(result["monitor_url"])
+        self.assertEqual(result["stop_policy"], "explicit-controlled-stop")
         self.assertEqual(
-            result["monitor_url"], "http://127.0.0.1:9005/"
+            healthy_roles,
+            [("learner", 180), ("aiserver", 60), ("client", 60)],
+        )
+        self.assertTrue(
+            result["readiness"]["client_session_policy_ready"]
         )
 
-    def test_completion_requires_trained_disposition_not_only_ack(self):
-        record = {
-            "actor": {
-                "produced": 3072,
-                "outbound_pending": 0,
-                "final_drop": 0,
-            },
-            "distributor": {
-                "accepted": 3072,
-                "acked": 3072,
-                "ready_samples": 0,
-                "leased_samples": 0,
-                "trained": 1024,
-                "stale": 2048,
-                "invalid": 0,
-                "shutdown_untrained": 0,
-            },
-            "learner": {
-                "model_version": 2,
-                "initial_model_version": 0,
-                "run_train_updates": 2,
-                "run_trained_samples": 1024,
-                "train_batch_size": 512,
-                "max_train_batch_size": 639,
-            },
-        }
-
-        completion = training_completion_status(record, 3072)
-
-        self.assertFalse(completion["complete"])
-        self.assertTrue(completion["failed"])
-        self.assertIn(
-            "non_trained_disposition_stale", completion["reasons"]
-        )
-
-    def test_completion_uses_run_scoped_resume_counters(self):
-        record = {
-            "actor": {
-                "produced": 3072,
-                "outbound_pending": 0,
-                "final_drop": 0,
-            },
-            "distributor": {
-                "accepted": 3072,
-                "acked": 3072,
-                "ready_samples": 0,
-                "leased_samples": 0,
-                "trained": 3072,
-                "stale": 0,
-                "invalid": 0,
-                "shutdown_untrained": 0,
-            },
-            "learner": {
-                "model_version": 26,
-                "initial_model_version": 20,
-                "train_updates": 26,
-                "trained_samples": 13072,
-                "run_train_updates": 6,
-                "run_trained_samples": 3072,
-                "train_batch_size": 512,
-                "max_train_batch_size": 639,
-            },
-        }
-
-        completion = training_completion_status(record, 3072)
-
-        self.assertTrue(completion["complete"], completion["reasons"])
-
-    def test_completion_accepts_bounded_whole_fragment_update_count(self):
-        record = {
-            "actor": {
-                "produced": 3072,
-                "outbound_pending": 0,
-                "final_drop": 0,
-            },
-            "distributor": {
-                "accepted": 3072,
-                "acked": 3072,
-                "ready_samples": 0,
-                "leased_samples": 0,
-                "trained": 3072,
-                "stale": 0,
-                "invalid": 0,
-                "shutdown_untrained": 0,
-            },
-            "learner": {
-                "model_version": 5,
-                "initial_model_version": 0,
-                "run_train_updates": 5,
-                "run_trained_samples": 3072,
-                "train_batch_size": 512,
-                "max_train_batch_size": 639,
-            },
-        }
-
-        completion = training_completion_status(record, 3072)
-
-        self.assertTrue(completion["complete"], completion["reasons"])
-        self.assertEqual(completion["counts"]["expected_updates_min"], 5)
-        self.assertEqual(completion["counts"]["expected_updates_max"], 6)
-
-    def test_framework_requests_final_drain_only_after_producer_flush(self):
+    def test_training_does_not_report_ready_before_client_session_policy(self):
         runtime = DockerRuntime(self.spec)
-        record = {
-            "actor": {
-                "produced": 3072,
-                "accepted": 3072,
-                "outbound_pending": 0,
-                "final_drop": 0,
-            },
-            "distributor": {"accepted": 3072},
-        }
-        docker_results = [
-            mock.Mock(returncode=0, stdout="", stderr=""),
-            mock.Mock(returncode=0, stdout="", stderr=""),
-        ]
-        events = []
+
+        def wait_healthy(role, timeout):
+            if role == "client":
+                raise RuntimeFailure("client session policy was not published")
+
         with (
-            mock.patch.object(runtime, "_require_running"),
+            mock.patch.object(runtime, "_run_container"),
             mock.patch.object(
-                runtime,
-                "_http_json",
-                return_value={"record": record},
+                runtime, "_wait_healthy", side_effect=wait_healthy
             ),
+            mock.patch.object(runtime, "_record") as record,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeFailure, "session policy was not published"
+            ):
+                runtime._start_training()
+
+        self.assertNotIn(
+            "training_chain_ready",
+            [call.args[0] for call in record.call_args_list],
+        )
+
+    def test_start_refuses_to_implicitly_stop_an_active_training_run(self):
+        runtime = DockerRuntime(self.spec)
+        running = mock.Mock(returncode=0, stdout="true\n", stderr="")
+        with (
+            mock.patch.object(runtime, "preflight"),
             mock.patch.object(
-                runtime, "_docker", side_effect=docker_results
-            ) as docker,
+                runtime, "_managed_containers", return_value=["learner-id"]
+            ),
+            mock.patch.object(runtime, "_docker", return_value=running),
+            mock.patch.object(runtime, "stop_run") as stop_run,
+            mock.patch.object(runtime, "_start_training") as start_training,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeFailure, "stop it explicitly"
+            ):
+                runtime.start()
+
+        stop_run.assert_not_called()
+        start_training.assert_not_called()
+
+    def test_concurrent_start_claim_is_fail_closed(self):
+        first = DockerRuntime(self.spec)
+        second = DockerRuntime(self.spec, runtime_scope="local-tests")
+        entered = False
+
+        def hold_first_start(*, wait_for_completion=False):
+            nonlocal entered
+            entered = True
+            with self.assertRaisesRegex(
+                RuntimeFailure, "run start conflicts"
+            ):
+                second.start()
+            return {"ready": True}
+
+        with (
+            mock.patch.object(first, "preflight"),
+            mock.patch.object(second, "preflight"),
             mock.patch.object(
-                runtime,
-                "_record",
-                side_effect=lambda state, detail="": events.append(state),
+                first, "_start_claimed", side_effect=hold_first_start
             ),
         ):
-            runtime._request_training_finalize(1)
+            self.assertEqual(first.start(), {"ready": True})
 
-        self.assertEqual(
-            docker.call_args_list[0].args[0][-1],
-            "/tmp/rl-training-finalize",
+        self.assertTrue(entered)
+
+    def test_stop_waits_for_start_preflight_claim_and_wins(self):
+        starter = DockerRuntime(self.spec)
+        stopper = DockerRuntime(self.spec)
+        preflight_started = threading.Event()
+        release_preflight = threading.Event()
+        start_finished = threading.Event()
+        stop_started = threading.Event()
+        stop_finished = threading.Event()
+        start_errors = []
+        stop_errors = []
+        start_thread = None
+        stop_thread = None
+
+        def hold_preflight():
+            preflight_started.set()
+            if not release_preflight.wait(1.0):
+                raise AssertionError("timed out waiting to release preflight")
+
+        def finish_start(*, wait_for_completion=False):
+            result = {"readiness": {"ready": True}}
+            starter._record("training_chain_ready")
+            starter._write_state("ready", result=result)
+            return result
+
+        def run_start():
+            try:
+                starter.start()
+            except Exception as exc:  # pragma: no cover - asserted below
+                start_errors.append(exc)
+            finally:
+                start_finished.set()
+
+        def stop_run():
+            stop_started.set()
+            try:
+                stopper.stop()
+            except Exception as exc:  # pragma: no cover - asserted below
+                stop_errors.append(exc)
+            finally:
+                stop_finished.set()
+
+        with (
+            mock.patch.object(
+                starter, "preflight", side_effect=hold_preflight
+            ),
+            mock.patch.object(
+                starter, "_start_claimed", side_effect=finish_start
+            ),
+            mock.patch.object(stopper, "stop_run"),
+        ):
+            start_thread = threading.Thread(target=run_start)
+            start_thread.start()
+            self.assertTrue(preflight_started.wait(1.0))
+            stop_thread = threading.Thread(target=stop_run)
+            stop_thread.start()
+            self.assertTrue(stop_started.wait(1.0))
+            self.assertFalse(stop_finished.wait(0.05))
+            release_preflight.set()
+            start_thread.join(1.0)
+            stop_thread.join(1.0)
+
+        self.assertTrue(start_finished.is_set())
+        self.assertTrue(stop_finished.is_set())
+        self.assertEqual(start_errors, [])
+        self.assertEqual(stop_errors, [])
+        state = json.loads(
+            (stopper.run_root / "state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["actual_status"], "stopped")
+        timeline = json.loads(
+            (stopper.run_root / "timeline.json").read_text(encoding="utf-8")
         )
         self.assertEqual(
-            docker.call_args_list[1].args[0][-1],
-            "/tmp/rl-training-finalized",
+            [event["state"] for event in timeline["events"]],
+            ["training_chain_ready", "stop_requested", "stopped"],
         )
+
+    def test_training_start_failure_requires_converged_cleanup(self):
+        runtime = DockerRuntime(self.spec)
+        cleanup_failure = RuntimeFailure("learner quiesce failed")
+        with (
+            mock.patch.object(runtime, "preflight"),
+            mock.patch.object(
+                runtime, "_managed_containers", return_value=[]
+            ),
+            mock.patch.object(runtime, "_assert_host_ports_available"),
+            mock.patch.object(runtime, "_ensure_network"),
+            mock.patch.object(
+                runtime,
+                "_start_training",
+                side_effect=RuntimeFailure("client readiness failed"),
+            ),
+            mock.patch.object(
+                runtime, "stop_run", side_effect=cleanup_failure
+            ) as stop_run,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeFailure, "startup cleanup did not converge"
+            ):
+                runtime.start()
+
+        stop_run.assert_called_once_with(require_quiesce=True)
         self.assertEqual(
-            events,
-            ["training_finalize_requested", "training_finalize_complete"],
+            json.loads(
+                (runtime.run_root / "state.json").read_text(encoding="utf-8")
+            )["actual_status"],
+            "stop_failed",
         )
+
+    def test_training_rejects_finite_completion_wait(self):
+        runtime = DockerRuntime(self.spec)
+        with self.assertRaisesRegex(RuntimeFailure, "training is unbounded"):
+            runtime._start_training(wait_for_completion=True)
 
     def test_platform_training_start_returns_after_chain_readiness(self):
         runtime = DockerRuntime(self.spec)
@@ -925,41 +1070,19 @@ class RuntimePortTransportTest(unittest.TestCase):
             mock.patch.object(runtime, "_wait_healthy"),
             mock.patch.object(
                 runtime,
-                "_ensure_host_port",
-                return_value="docker-publish",
+                "_require_running",
             ),
             mock.patch.object(
-                runtime,
-                "_wait_learner_monitor_transport",
-                return_value={"ready": True, "reasons": []},
+                runtime, "_container_metrics_latest", return_value=record
             ),
-            mock.patch.object(
-                runtime,
-                "_wait_training_ready",
-                return_value=(
-                    record,
-                    {"ready": True, "reasons": [], "model_lag": 0},
-                ),
-            ),
-            mock.patch.object(
-                runtime,
-                "_container_state",
-                return_value={"exists": True, "running": True},
-            ),
-            mock.patch.object(runtime, "_wait_container_exit") as wait_exit,
-            mock.patch.object(
-                runtime, "_validate_training_artifacts"
-            ) as validate_artifacts,
         ):
             result = runtime._start_training()
 
         self.assertEqual(result["actual_status"], "ready")
         self.assertEqual(result["phase"], "running")
         self.assertEqual(result["counts"]["produced"], 1)
-        wait_exit.assert_not_called()
-        validate_artifacts.assert_not_called()
 
-    def test_status_degrades_when_live_chain_identity_does_not_match(self):
+    def test_status_uses_core_processes_and_treats_metrics_as_optional(self):
         runtime = DockerRuntime(self.spec)
         checksum = "a" * 64
         identity = {
@@ -971,7 +1094,13 @@ class RuntimePortTransportTest(unittest.TestCase):
         timestamp = 100.0
         runtime._write_state(
             "ready",
-            result={"readiness": {"timestamp": timestamp}},
+            result={
+                "readiness": {
+                    "ready": True,
+                    "client_session_policy_ready": True,
+                    "timestamp": timestamp,
+                }
+            },
         )
         record = {
             "mode": "training",
@@ -1003,14 +1132,15 @@ class RuntimePortTransportTest(unittest.TestCase):
             "chain": {"ready": True},
         }
 
+        client_running = True
+
         def container_state(role):
-            if role == "client":
-                return {
-                    "exists": True,
-                    "running": False,
-                    "exit_code": 0,
-                }
-            return {"exists": True, "running": True, "exit_code": 0}
+            return {
+                "exists": True,
+                "running": client_running if role == "client" else True,
+                "health": "healthy",
+                "exit_code": 0,
+            }
 
         with (
             mock.patch.object(
@@ -1031,12 +1161,34 @@ class RuntimePortTransportTest(unittest.TestCase):
                 **identity,
                 "manifest_digest": "c" * 64,
             }
+            self.assertEqual(runtime.status()["actual_status"], "ready")
+            client_running = False
             degraded = runtime.status()
 
         self.assertEqual(degraded["actual_status"], "degraded")
-        self.assertIn(
-            "actor_model_ack_mismatch", degraded["readiness"]["reasons"]
-        )
+        self.assertFalse(degraded["readiness"]["ready"])
+
+    def test_status_never_promotes_starting_containers_to_ready(self):
+        runtime = DockerRuntime(self.spec)
+        runtime._write_state("starting")
+        container = {
+            "exists": True,
+            "running": True,
+            "health": "healthy",
+            "exit_code": 0,
+        }
+        with (
+            mock.patch.object(
+                runtime, "_container_state", return_value=container
+            ),
+            mock.patch.object(
+                runtime, "_container_metrics_latest", return_value={}
+            ),
+        ):
+            status = runtime.status()
+
+        self.assertEqual(status["actual_status"], "starting")
+        self.assertFalse(status["readiness"]["ready"])
 
     def test_required_quiesce_failure_is_reported_after_cleanup(self):
         runtime = DockerRuntime(self.spec)
@@ -1049,7 +1201,7 @@ class RuntimePortTransportTest(unittest.TestCase):
             mock.patch.object(
                 runtime,
                 "_managed_containers",
-                return_value=list(roles),
+                side_effect=[list(roles), []],
             ),
             mock.patch.object(
                 runtime,
@@ -1060,12 +1212,12 @@ class RuntimePortTransportTest(unittest.TestCase):
             mock.patch.object(
                 runtime,
                 "_stop_and_remove",
-                side_effect=lambda container_id, timeout: stopped.append(
-                    (container_id, timeout)
+                side_effect=lambda container_id, timeout: (
+                    stopped.append((container_id, timeout)) or True
                 ),
             ),
             mock.patch.object(runtime, "_stop_port_tunnels"),
-            mock.patch.object(runtime, "_remove_network"),
+            mock.patch.object(runtime, "_remove_network", return_value=True),
         ):
             with self.assertRaisesRegex(Exception, "aiserver, learner"):
                 runtime.stop_run(require_quiesce=True)
@@ -1074,6 +1226,49 @@ class RuntimePortTransportTest(unittest.TestCase):
             stopped,
             [("aiserver-id", 5), ("learner-id", 5)],
         )
+
+    def test_quiesce_requires_explicit_success_marker(self):
+        runtime = DockerRuntime(self.spec)
+        stopped = mock.Mock(returncode=0, stdout="false\n", stderr="")
+        with mock.patch.object(runtime, "_docker", return_value=stopped):
+            self.assertFalse(runtime._quiesce("learner-id", 1))
+
+    def test_quiesce_failure_marker_wins_over_success(self):
+        runtime = DockerRuntime(self.spec)
+        responses = [
+            mock.Mock(returncode=0, stdout="true\n", stderr=""),
+            mock.Mock(returncode=0, stdout="", stderr=""),
+            mock.Mock(returncode=0, stdout="", stderr=""),
+        ]
+        with mock.patch.object(
+            runtime, "_docker", side_effect=responses
+        ):
+            self.assertFalse(runtime._quiesce("learner-id", 1))
+
+    def test_stop_fails_when_managed_container_remains(self):
+        runtime = DockerRuntime(self.spec)
+        roles = {"client-id": "client"}
+        with (
+            mock.patch.object(
+                runtime,
+                "_managed_containers",
+                side_effect=[list(roles), list(roles)],
+            ),
+            mock.patch.object(
+                runtime,
+                "_container_role",
+                side_effect=lambda container_id: roles[container_id],
+            ),
+            mock.patch.object(
+                runtime, "_stop_and_remove", return_value=False
+            ),
+            mock.patch.object(runtime, "_stop_port_tunnels"),
+            mock.patch.object(runtime, "_remove_network", return_value=True),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeFailure, "client, managed-containers"
+            ):
+                runtime.stop_run()
 
     def test_port_conflict_reports_owner(self):
         runtime = DockerRuntime(self.spec)

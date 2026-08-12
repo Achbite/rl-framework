@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -10,7 +11,6 @@ import subprocess
 import tempfile
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -19,8 +19,6 @@ from .spec import RunSpec
 
 EVALUATION_MODEL_FILE = "SaveModel.onnx"
 AISERVER_LOCAL_TEST_MODEL_DIR = "/opt/rl/aiserver/models/local-test"
-LEARNER_FINALIZE_REQUEST = "/tmp/rl-training-finalize"
-LEARNER_FINALIZE_COMPLETE = "/tmp/rl-training-finalized"
 
 
 class RuntimeFailure(RuntimeError):
@@ -288,137 +286,6 @@ def training_record_readiness(
     }
 
 
-def training_completion_status(
-    record: dict[str, Any], expected_samples: int
-) -> dict[str, Any]:
-    actor = record.get("actor") if isinstance(record.get("actor"), dict) else {}
-    distributor = (
-        record.get("distributor")
-        if isinstance(record.get("distributor"), dict)
-        else {}
-    )
-    learner = (
-        record.get("learner")
-        if isinstance(record.get("learner"), dict)
-        else {}
-    )
-
-    def integer(document: dict[str, Any], field: str, default: int = 0) -> int:
-        try:
-            return int(document.get(field, default))
-        except (TypeError, ValueError):
-            return default
-
-    counts = {
-        "expected": int(expected_samples),
-        "produced": integer(actor, "produced"),
-        "outbound_pending": integer(actor, "outbound_pending"),
-        "final_drop": integer(actor, "final_drop"),
-        "accepted": integer(distributor, "accepted"),
-        "acked": integer(distributor, "acked"),
-        "ready": integer(distributor, "ready_samples"),
-        "leased": integer(distributor, "leased_samples"),
-        "trained": integer(distributor, "trained"),
-        "stale": integer(distributor, "stale"),
-        "invalid": integer(distributor, "invalid"),
-        "shutdown_untrained": integer(distributor, "shutdown_untrained"),
-        "learner_run_trained": integer(learner, "run_trained_samples", -1),
-        "learner_run_updates": integer(learner, "run_train_updates", -1),
-        "train_batch_size": integer(learner, "train_batch_size", -1),
-        "max_train_batch_size": integer(
-            learner, "max_train_batch_size", -1
-        ),
-        "initial_model_version": integer(
-            learner, "initial_model_version", -1
-        ),
-        "model_version": integer(learner, "model_version", -1),
-    }
-    reasons: list[str] = []
-    fatal_reasons: list[str] = []
-
-    for field in ("stale", "invalid", "shutdown_untrained"):
-        if counts[field] != 0:
-            reason = f"non_trained_disposition_{field}"
-            reasons.append(reason)
-            fatal_reasons.append(reason)
-    if counts["final_drop"] != 0:
-        reasons.append("actor_final_drop_nonzero")
-        fatal_reasons.append("actor_final_drop_nonzero")
-
-    for field in ("produced", "accepted", "acked", "trained"):
-        if counts[field] > expected_samples:
-            reason = f"{field}_exceeds_expected"
-            reasons.append(reason)
-            fatal_reasons.append(reason)
-    if counts["learner_run_trained"] > expected_samples:
-        reasons.append("learner_run_trained_exceeds_expected")
-        fatal_reasons.append("learner_run_trained_exceeds_expected")
-
-    if counts["produced"] != (
-        counts["accepted"]
-        + counts["outbound_pending"]
-        + counts["final_drop"]
-    ):
-        reasons.append("actor_sample_conservation_mismatch")
-    if counts["accepted"] != (
-        counts["ready"] + counts["leased"] + counts["acked"]
-    ):
-        reasons.append("sample_pool_resident_conservation_mismatch")
-    if counts["acked"] != (
-        counts["trained"]
-        + counts["stale"]
-        + counts["invalid"]
-        + counts["shutdown_untrained"]
-    ):
-        reasons.append("ack_disposition_conservation_mismatch")
-
-    target_batch = counts["train_batch_size"]
-    max_batch = counts["max_train_batch_size"]
-    if target_batch <= 0 or max_batch < target_batch:
-        minimum_updates = maximum_updates = -1
-        reasons.append("bounded_batch_contract_invalid")
-    else:
-        minimum_updates = (expected_samples + max_batch - 1) // max_batch
-        maximum_updates = (
-            expected_samples + target_batch - 1
-        ) // target_batch
-    counts["expected_updates_min"] = minimum_updates
-    counts["expected_updates_max"] = maximum_updates
-    if not (
-        minimum_updates >= 0
-        and minimum_updates
-        <= counts["learner_run_updates"]
-        <= maximum_updates
-    ):
-        reasons.append("learner_run_update_count_mismatch")
-    if counts["learner_run_trained"] != expected_samples:
-        reasons.append("learner_run_trained_count_mismatch")
-    if (
-        counts["model_version"] - counts["initial_model_version"]
-        != counts["learner_run_updates"]
-    ):
-        reasons.append("model_version_delta_mismatch")
-
-    for field in ("produced", "accepted", "acked", "trained"):
-        if counts[field] != expected_samples:
-            reasons.append(f"{field}_not_expected")
-    if counts["outbound_pending"] != 0:
-        reasons.append("actor_outbound_pending_nonzero")
-    if counts["ready"] != 0:
-        reasons.append("sample_pool_ready_nonzero")
-    if counts["leased"] != 0:
-        reasons.append("sample_pool_leased_nonzero")
-
-    reasons = list(dict.fromkeys(reasons))
-    return {
-        "complete": not reasons,
-        "failed": bool(fatal_reasons),
-        "reasons": reasons,
-        "fatal_reasons": list(dict.fromkeys(fatal_reasons)),
-        "counts": counts,
-    }
-
-
 def workspace_root() -> Path:
     configured = os.environ.get("RL_TRAINING_WORKSPACE")
     if configured:
@@ -437,8 +304,36 @@ class DockerRuntime:
         self.run_root = self.runtime_root / runtime_scope / spec.run_id
         self.tunnel_root = self.runtime_root / "tunnels"
         run_key = hashlib.sha256(spec.run_id.encode("utf-8")).hexdigest()[:16]
+        self.lifecycle_lock_path = (
+            self.runtime_root / "locks" / f"{run_key}.lock"
+        )
         self.network = f"rl-training-{run_key}"
         self._events = self._load_events()
+
+    def _acquire_lifecycle_lock(
+        self, *, blocking: bool, operation: str
+    ):
+        self.lifecycle_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        claim = self.lifecycle_lock_path.open("a+", encoding="utf-8")
+        flags = fcntl.LOCK_EX
+        if not blocking:
+            flags |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(claim.fileno(), flags)
+        except BlockingIOError as exc:
+            claim.close()
+            raise RuntimeFailure(
+                f"run {operation} conflicts with another lifecycle "
+                "operation; wait for it to finish"
+            ) from exc
+        return claim
+
+    @staticmethod
+    def _release_lifecycle_lock(claim) -> None:
+        try:
+            fcntl.flock(claim.fileno(), fcntl.LOCK_UN)
+        finally:
+            claim.close()
 
     @staticmethod
     def _resolve_evaluation_model(configured_path: str) -> tuple[Path, Path]:
@@ -723,12 +618,21 @@ class DockerRuntime:
                 ]
             )
 
-    def _remove_network(self) -> None:
-        result = self._docker(
-            ["network", "inspect", self.network], check=False
-        )
-        if result.returncode == 0:
-            self._docker(["network", "rm", self.network], check=False)
+    def _remove_network(self) -> bool:
+        query = [
+            "network",
+            "ls",
+            "--filter",
+            f"name=^{self.network}$",
+            "--format",
+            "{{.Name}}",
+        ]
+        existing = self._docker(query)
+        if self.network not in existing.stdout.splitlines():
+            return True
+        self._docker(["network", "rm", self.network], check=False)
+        remaining = self._docker(query)
+        return self.network not in remaining.stdout.splitlines()
 
     def _managed_containers(self) -> list[str]:
         result = self._docker(
@@ -755,7 +659,7 @@ class DockerRuntime:
         )
         return result.stdout.strip()
 
-    def _stop_and_remove(self, container_id: str, timeout: int) -> None:
+    def _stop_and_remove(self, container_id: str, timeout: int) -> bool:
         state = self._docker(
             ["inspect", "--format", "{{.State.Running}}", container_id],
             check=False,
@@ -767,6 +671,9 @@ class DockerRuntime:
                 timeout=timeout + 10,
             )
         self._docker(["rm", container_id], check=False)
+        return self._docker(
+            ["inspect", container_id], check=False
+        ).returncode != 0
 
     def _quiesce(self, container_id: str, timeout: int) -> bool:
         state = self._docker(
@@ -774,7 +681,7 @@ class DockerRuntime:
             check=False,
         )
         if state.returncode != 0 or state.stdout.strip() != "true":
-            return True
+            return False
         signal_result = self._docker(
             ["kill", "--signal", "USR1", container_id],
             check=False,
@@ -783,6 +690,18 @@ class DockerRuntime:
             return False
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            failure = self._docker(
+                [
+                    "exec",
+                    container_id,
+                    "test",
+                    "-f",
+                    "/tmp/rl-training-quiesce-failed",
+                ],
+                check=False,
+            )
+            if failure.returncode == 0:
+                return False
             marker = self._docker(
                 [
                     "exec",
@@ -810,24 +729,36 @@ class DockerRuntime:
         for container_id in containers:
             roles.setdefault(self._container_role(container_id), []).append(container_id)
         quiesce_failures = []
+        cleanup_failures = []
         for container_id in roles.get("client", []):
-            self._stop_and_remove(container_id, 5)
+            if not self._stop_and_remove(container_id, 5):
+                cleanup_failures.append("client")
         for container_id in roles.get("aiserver", []):
-            if not self._quiesce(container_id, 20):
+            if not self._quiesce(container_id, 60):
                 quiesce_failures.append("aiserver")
         for container_id in roles.get("learner", []):
             if not self._quiesce(container_id, 130):
                 quiesce_failures.append("learner")
         for container_id in roles.get("aiserver", []):
-            self._stop_and_remove(container_id, 5)
+            if not self._stop_and_remove(container_id, 5):
+                cleanup_failures.append("aiserver")
         for container_id in roles.get("learner", []):
-            self._stop_and_remove(container_id, 5)
+            if not self._stop_and_remove(container_id, 5):
+                cleanup_failures.append("learner")
         self._stop_port_tunnels()
-        self._remove_network()
+        remaining = self._managed_containers()
+        if remaining:
+            cleanup_failures.append("managed-containers")
+        if not self._remove_network():
+            cleanup_failures.append("network")
+        failures = []
         if require_quiesce and quiesce_failures:
-            failed = ", ".join(sorted(set(quiesce_failures)))
+            failures.extend(quiesce_failures)
+        failures.extend(cleanup_failures)
+        if failures:
+            failed = ", ".join(sorted(set(failures)))
             raise RuntimeFailure(
-                f"training shutdown forced after quiesce failed: {failed}"
+                "runtime shutdown did not converge: " + failed
             )
 
     def _assert_host_ports_available(self, ports: tuple[int, ...]) -> None:
@@ -895,9 +826,15 @@ class DockerRuntime:
         if result.returncode != 0:
             return {"exists": False, "running": False}
         state = json.loads(result.stdout)
+        health = state.get("Health")
         return {
             "exists": True,
             "running": bool(state.get("Running")),
+            "health": (
+                health.get("Status", "unknown")
+                if isinstance(health, dict)
+                else "missing"
+            ),
             "status": state.get("Status", "unknown"),
             "exit_code": state.get("ExitCode"),
             "started_at": state.get("StartedAt"),
@@ -1257,109 +1194,6 @@ class DockerRuntime:
             f"reasons={last_readiness['reasons']}"
         )
 
-    def _wait_metrics(self, timeout: float) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout
-        expected = self.spec.expected_samples
-        url = "http://127.0.0.1:9005/api/metrics/latest"
-        last_record: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            self._require_running("learner")
-            self._require_running("aiserver")
-            try:
-                payload = self._http_json(url)
-                last_record = payload.get("record", {})
-            except RuntimeFailure:
-                time.sleep(0.3)
-                continue
-            completion = training_completion_status(last_record, expected)
-            if completion["complete"]:
-                return last_record
-            if completion["failed"]:
-                raise RuntimeFailure(
-                    "training completion gate failed: "
-                    + ",".join(completion["fatal_reasons"])
-                )
-            time.sleep(0.5)
-        raise RuntimeFailure(
-            f"training loop timeout; expected={expected}, last={last_record}"
-        )
-
-    def _request_training_finalize(self, timeout: float) -> None:
-        deadline = time.monotonic() + timeout
-        expected = self.spec.expected_samples
-        url = "http://127.0.0.1:9005/api/metrics/latest"
-        last_record: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            self._require_running("learner")
-            self._require_running("aiserver")
-            try:
-                payload = self._http_json(url)
-                last_record = payload.get("record", {})
-            except RuntimeFailure:
-                time.sleep(0.2)
-                continue
-            actor = last_record.get("actor", {})
-            distributor = last_record.get("distributor", {})
-            produced = int(actor.get("produced", -1))
-            actor_accepted = int(actor.get("accepted", -1))
-            pool_accepted = int(distributor.get("accepted", -1))
-            outbound = int(actor.get("outbound_pending", -1))
-            final_drop = int(actor.get("final_drop", -1))
-            if any(
-                value > expected
-                for value in (produced, actor_accepted, pool_accepted)
-            ) or final_drop > 0:
-                raise RuntimeFailure(
-                    "producer completion exceeded its finite Run contract"
-                )
-            if (
-                produced == expected
-                and actor_accepted == expected
-                and pool_accepted == expected
-                and outbound == 0
-                and final_drop == 0
-            ):
-                break
-            time.sleep(0.2)
-        else:
-            raise RuntimeFailure(
-                "producer did not flush the finite Run before final drain: "
-                f"{last_record}"
-            )
-
-        request = self._docker(
-            [
-                "exec",
-                self._name("learner"),
-                "touch",
-                LEARNER_FINALIZE_REQUEST,
-            ],
-            check=False,
-        )
-        if request.returncode != 0:
-            detail = request.stderr.strip() or request.stdout.strip()
-            raise RuntimeFailure(
-                f"Learner finalize request failed: {detail}"
-            )
-        self._record("training_finalize_requested")
-        while time.monotonic() < deadline:
-            self._require_running("learner")
-            marker = self._docker(
-                [
-                    "exec",
-                    self._name("learner"),
-                    "test",
-                    "-f",
-                    LEARNER_FINALIZE_COMPLETE,
-                ],
-                check=False,
-            )
-            if marker.returncode == 0:
-                self._record("training_finalize_complete")
-                return
-            time.sleep(0.2)
-        raise RuntimeFailure("Learner final sample drain timed out")
-
     def _wait_training_ready(
         self, minimum_timestamp: float, timeout: float
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1409,6 +1243,7 @@ class DockerRuntime:
         local_train_root: Path,
         current_version: int,
         max_policy_lag: int,
+        initial_model_version: int,
     ) -> dict[str, Any]:
         runtime = local_train_root / "runtime"
         published = runtime / "serving"
@@ -1416,11 +1251,28 @@ class DockerRuntime:
         archive = local_train_root / "archive"
         updates = runtime / "receipts"
         if (
-            current_version < 2
-            or max_policy_lag < 0
+            isinstance(current_version, bool)
+            or isinstance(initial_model_version, bool)
+            or not isinstance(current_version, int)
+            or not isinstance(initial_model_version, int)
+            or initial_model_version < 0
+            or current_version - initial_model_version < 2
             or isinstance(max_policy_lag, bool)
+            or not isinstance(max_policy_lag, int)
+            or max_policy_lag < 0
         ):
-            raise RuntimeFailure("training did not publish model v2")
+            raise RuntimeFailure(
+                "training did not publish two run-scoped model updates"
+            )
+
+        probe_versions = (
+            initial_model_version,
+            initial_model_version + 1,
+            initial_model_version + 2,
+        )
+        update_probe_versions = probe_versions[1:]
+        second_update_version = update_probe_versions[-1]
+        archive_versions = (initial_model_version, second_update_version)
 
         receipts: dict[int, dict[str, Any]] = {}
         for path in updates.glob("*.json"):
@@ -1431,7 +1283,7 @@ class DockerRuntime:
         identity_checksums: list[str] = []
         archive_manifests: dict[int, dict[str, Any]] = {}
         archive_identities: dict[int, dict[str, Any]] = {}
-        for version in (0, 2):
+        for version in archive_versions:
             version_dir = archive / f"{version:06d}"
             manifest_path = version_dir / "manifest.json"
             if not manifest_path.is_file():
@@ -1454,10 +1306,10 @@ class DockerRuntime:
                 manifest, version=version, checksum=checksum
             )
             archive_manifests[version] = manifest
-            if version == 0:
+            if version == initial_model_version:
                 identity_checksums.append(checksum)
 
-        for version in (1, 2):
+        def receipt_identity(version: int) -> dict[str, Any]:
             receipt = receipts.get(version)
             identity = (receipt or {}).get("model")
             if (
@@ -1478,14 +1330,27 @@ class DockerRuntime:
                 raise RuntimeFailure(
                     f"model v{version} receipt identity is missing"
                 )
+            return identity
+
+        for version in update_probe_versions:
+            identity = receipt_identity(version)
             identity_checksums.append(identity["artifact_digest"])
-        if len(set(identity_checksums)) != 3:
-            raise RuntimeFailure("v0, v1, and v2 checksums must differ")
+        if len(set(identity_checksums)) != len(probe_versions):
+            raise RuntimeFailure(
+                "baseline and first two update checksums must differ"
+            )
+        second_update_identity = receipt_identity(second_update_version)
         if (
-            archive_identities[2]["artifact_digest"]
-            != receipts[2]["model"]["artifact_digest"]
+            archive_identities[second_update_version]
+            != second_update_identity
         ):
-            raise RuntimeFailure("archive v2 and receipt identity differ")
+            raise RuntimeFailure(
+                "second run-scoped update archive and receipt identity differ"
+            )
+        current_identity = receipt_identity(current_version)
+        current_update_id = receipts[current_version].get("train_update_id")
+        if not current_update_id:
+            raise RuntimeFailure("current model update receipt is missing")
 
         def behavior_version_range(
             receipt: dict[str, Any], *, target_version: int
@@ -1573,16 +1438,21 @@ class DockerRuntime:
             version: behavior_version_range(
                 receipts[version], target_version=version
             )
-            for version in (1, 2)
+            for version in update_probe_versions
         }
-        v2_receipt = receipts[2]
-        v2_update_id = v2_receipt.get("train_update_id")
-        if not v2_update_id:
-            raise RuntimeFailure("model v2 update receipt is missing")
+        second_update_receipt = receipts[second_update_version]
+        second_update_id = second_update_receipt.get("train_update_id")
+        if not second_update_id:
+            raise RuntimeFailure(
+                "second run-scoped model update receipt is missing"
+            )
 
         required_versions = list(
             range(
-                max(0, current_version - max_policy_lag),
+                max(
+                    initial_model_version,
+                    current_version - max_policy_lag,
+                ),
                 current_version + 1,
             )
         )
@@ -1595,6 +1465,7 @@ class DockerRuntime:
                 "runtime serving directory is missing the required policy "
                 "freshness window"
             )
+        runtime_identities: dict[int, dict[str, Any]] = {}
         for version in required_versions:
             manifest_path = published / f"manifest_v{version:06d}.json"
             model_path = published / f"model_v{version:06d}.onnx"
@@ -1603,7 +1474,7 @@ class DockerRuntime:
                 manifest_path.read_text(encoding="utf-8")
             )
             checksum = hashlib.sha256(model_path.read_bytes()).hexdigest()
-            self._runtime_model_identity(
+            runtime_identities[version] = self._runtime_model_identity(
                 manifest,
                 version=version,
                 checksum=checksum,
@@ -1613,6 +1484,10 @@ class DockerRuntime:
                 raise RuntimeFailure(
                     f"runtime model v{version} checkpoint is missing"
                 )
+        if runtime_identities[current_version] != current_identity:
+            raise RuntimeFailure(
+                "current runtime and receipt model identity differ"
+            )
         checkpoint_probe = self._docker(
             [
                 "exec",
@@ -1637,20 +1512,39 @@ class DockerRuntime:
         if (
             checkpoint.get("version") != current_version
             or not checkpoint.get("optimizer")
-            or not checkpoint.get("update")
+            or checkpoint.get("update") != current_update_id
         ):
             raise RuntimeFailure(
                 "current runtime checkpoint identity is invalid"
             )
-        return {
+        result = {
             "runtime_versions": actual_retained,
             "required_runtime_versions": required_versions,
-            "archived_versions": [0, 2],
-            "identity_checksums_v0_v1_v2": identity_checksums,
-            "v2_train_update_id": v2_update_id,
-            "v2_behavior_model_version_range": list(behavior_ranges[2]),
+            "archived_versions": list(archive_versions),
+            "initial_model_version": initial_model_version,
+            "probe_versions": list(probe_versions),
+            "identity_checksums_baseline_first_two_updates": (
+                identity_checksums
+            ),
+            "second_update_train_update_id": second_update_id,
+            "second_update_behavior_model_version_range": list(
+                behavior_ranges[second_update_version]
+            ),
             "current_version": current_version,
         }
+        if initial_model_version == 0:
+            # Preserve the schema-v1 fresh-run acceptance aliases while the
+            # generic fields above carry the same evidence for resumed runs.
+            result.update(
+                {
+                    "identity_checksums_v0_v1_v2": identity_checksums,
+                    "v2_train_update_id": second_update_id,
+                    "v2_behavior_model_version_range": list(
+                        behavior_ranges[second_update_version]
+                    ),
+                }
+            )
+        return result
 
     def _wait_container_exit(self, role: str, timeout: float) -> int:
         name = self._name(role)
@@ -1674,15 +1568,43 @@ class DockerRuntime:
         ]
 
     def start(self, *, wait_for_completion: bool = False) -> dict[str, Any]:
-        self.preflight()
-        self.stop_run()
-        self.run_root.mkdir(parents=True, exist_ok=True)
+        claim = self._acquire_lifecycle_lock(
+            blocking=False, operation="start"
+        )
+        try:
+            self.preflight()
+            self.run_root.mkdir(parents=True, exist_ok=True)
+            return self._start_claimed(
+                wait_for_completion=wait_for_completion
+            )
+        finally:
+            self._release_lifecycle_lock(claim)
+
+    def _start_claimed(
+        self, *, wait_for_completion: bool = False
+    ) -> dict[str, Any]:
+        existing = self._managed_containers()
+        active_or_unknown: list[str] = []
+        for container_id in existing:
+            state = self._docker(
+                ["inspect", "--format", "{{.State.Running}}", container_id],
+                check=False,
+            )
+            if state.returncode != 0 or state.stdout.strip() != "false":
+                active_or_unknown.append(container_id)
+        if active_or_unknown:
+            raise RuntimeFailure(
+                "run already has active or unverifiable managed containers; "
+                "stop it explicitly before starting again"
+            )
+        if existing:
+            self.stop_run()
         self._events = []
         self._record("preflight_complete")
         self._write_state("starting")
         required_ports = {
             "local-test": (9004,),
-            "training": (9005,),
+            "training": (),
             "model-evaluation": (9004,),
         }[self.spec.mode]
         try:
@@ -1699,12 +1621,28 @@ class DockerRuntime:
         except Exception as exc:
             self._record("failed", str(exc))
             self._write_state("failed", error=str(exc))
-            self.stop_run()
+            try:
+                self.stop_run(
+                    require_quiesce=self.spec.mode == "training"
+                )
+            except RuntimeFailure as cleanup_exc:
+                combined = (
+                    f"{exc}; startup cleanup did not converge: "
+                    f"{cleanup_exc}"
+                )
+                self._record("stop_failed", str(cleanup_exc))
+                self._write_state("stop_failed", error=combined)
+                raise RuntimeFailure(combined) from exc
             raise
 
     def _start_training(
         self, *, wait_for_completion: bool = False
     ) -> dict[str, Any]:
+        if wait_for_completion:
+            raise RuntimeFailure(
+                "training is unbounded; start it without a completion wait "
+                "and stop it explicitly"
+            )
         launch_started_at = time.time()
         learner_logs = self.run_root / "learner/logs"
         learner_local_train = self.run_root / "learner-local-train"
@@ -1728,8 +1666,6 @@ class DockerRuntime:
             "RL_AISERVER_HOST=maze-aiserver",
             "--env",
             "RL_LOCAL_TRAIN_ROOT=/opt/rl/learner/models/local-train",
-            "--publish",
-            "127.0.0.1:9005:9005",
             "--volume",
             f"{learner_logs}:/opt/rl/learner/logs",
             "--volume",
@@ -1765,9 +1701,6 @@ class DockerRuntime:
             learner_arguments,
         )
         self._wait_healthy("learner", 180)
-        monitor_transport = self._ensure_host_port(
-            9005, 180, record_transport=False
-        )
 
         self._run_container(
             "aiserver",
@@ -1780,8 +1713,6 @@ class DockerRuntime:
                 "RL_SAMPLE_DISTRIBUTOR_HOST=maze-learner",
                 "--env",
                 "RL_LOCAL_TRAIN_ROOT=/opt/rl/aiserver/models/local-train",
-                "--env",
-                f"RL_TRAINING_SAMPLE_BUDGET={self.spec.expected_samples}",
                 "--volume",
                 f"{aiserver_logs}:/opt/rl/aiserver/log",
                 "--volume",
@@ -1793,8 +1724,6 @@ class DockerRuntime:
         )
         self._wait_healthy("aiserver", 60)
         self._record("model_v0_loaded_ack")
-        self._wait_learner_monitor_transport(launch_started_at, 15)
-        self._record_port_transport(9005, monitor_transport)
         self._record("learner_pod_ready")
         self._record("aiserver_ready")
 
@@ -1805,126 +1734,53 @@ class DockerRuntime:
                 *self._base_env(),
                 "--env",
                 "RL_AISERVER_HOST=maze-aiserver",
+                "--env",
+                "RL_EXPECTED_WORKLOAD=training",
                 "--volume",
                 f"{client_logs}:/opt/rl/maze-client/log",
             ],
         )
         self._record("client_started")
-        readiness_record, readiness = self._wait_training_ready(
-            launch_started_at, 90
-        )
+        self._wait_healthy("client", 60)
+        readiness_record: dict[str, Any] = {}
+        try:
+            readiness_record = self._container_metrics_latest()
+        except RuntimeFailure:
+            pass
+        readiness = {
+            "ready": True,
+            "source": "core-container-health-and-client-session-policy",
+            "learner_healthy": True,
+            "aiserver_healthy": True,
+            "client_running": True,
+            "client_session_policy_ready": True,
+            "observability_available": bool(readiness_record),
+            "timestamp": launch_started_at,
+        }
         self._record("training_chain_ready")
-        if not wait_for_completion:
-            actor = readiness_record.get("actor", {})
-            distributor = readiness_record.get("distributor", {})
-            learner = readiness_record.get("learner", {})
-            client_state = self._container_state("client")
-            self._record("training_ready")
-            monitor_source = (
-                "local-dev" if self.runtime_scope == "local-tests" else "platform"
-            )
-            return {
-                "schema_version": 1,
-                "task_id": self.spec.task_id,
-                "run_id": self.spec.run_id,
-                "mode": self.spec.mode,
-                "actual_status": "ready",
-                "phase": (
-                    "running"
-                    if client_state.get("running")
-                    else "workload-completed"
-                ),
-                "readiness": readiness,
-                "counts": {
-                    "expected": self.spec.expected_samples,
-                    "produced": int(actor.get("produced", 0)),
-                    "accepted": int(distributor.get("accepted", 0)),
-                    "acked": int(distributor.get("acked", 0)),
-                    "final_drop": int(actor.get("final_drop", 0)),
-                },
-                "train_updates": int(learner.get("train_updates", 0)),
-                "model_version": int(learner.get("model_version", 0)),
-                "monitor_url": (
-                    "http://127.0.0.1:9005/"
-                    if self.runtime_scope == "local-tests"
-                    else (
-                        "http://127.0.0.1:9010/infra?"
-                        f"source={monitor_source}&run_id="
-                        f"{urllib.parse.quote(self.spec.run_id)}"
-                    )
-                ),
-                "ports": {"learner_metrics": 9005},
-                "internal_ports": {
-                    "aiserver": 9002,
-                    "local_sample_service": 9100,
-                    "model_distributor": 9200,
-                },
-            }
-        client_exit = self._wait_container_exit("client", 300)
-        if client_exit != 0:
-            logs = self._docker(
-                ["logs", "--tail", "120", self._name("client")], check=False
-            )
-            raise RuntimeFailure(
-                f"client exited with {client_exit}: "
-                f"{logs.stderr.strip() or logs.stdout.strip()}"
-            )
-        self._record("client_completed")
-
-        self._request_training_finalize(90)
-
-        metrics = self._wait_metrics(180)
-        current_version = int(metrics["learner"]["model_version"])
-        max_policy_lag = int(metrics["learner"]["max_policy_lag"])
-        artifacts = self._validate_training_artifacts(
-            learner_local_train, current_version, max_policy_lag
-        )
-        client_ports = self._docker(
-            [
-                "inspect",
-                "--format",
-                "{{json .HostConfig.PortBindings}}",
-                self._name("client"),
-            ],
-            check=False,
-        )
-        if "9004" in client_ports.stdout:
-            raise RuntimeFailure("training Client published Replay port 9004")
+        actor = readiness_record.get("actor", {})
+        distributor = readiness_record.get("distributor", {})
+        learner = readiness_record.get("learner", {})
         self._record("training_ready")
-        completion = training_completion_status(
-            metrics, self.spec.expected_samples
-        )
-        if not completion["complete"]:
-            raise RuntimeFailure(
-                "training completion changed before artifact validation: "
-                + ",".join(completion["reasons"])
-            )
-        counts = completion["counts"]
-        self._atomic_json(
-            self.run_root / "sample-conservation.json",
-            {"schema_version": 2, "run_id": self.spec.run_id, **counts},
-        )
         return {
             "schema_version": 1,
             "task_id": self.spec.task_id,
             "run_id": self.spec.run_id,
             "mode": self.spec.mode,
             "actual_status": "ready",
-            "counts": counts,
-            "models": artifacts,
-            "train_updates": int(metrics["learner"]["train_updates"]),
-            "trained_samples": int(metrics["learner"]["trained_samples"]),
-            "monitor_url": (
-                "http://127.0.0.1:9005/"
-                if self.runtime_scope == "local-tests"
-                else (
-                    "http://127.0.0.1:9010/infra?source=platform&run_id="
-                    f"{urllib.parse.quote(self.spec.run_id)}"
-                )
-            ),
-            "ports": {
-                "learner_metrics": 9005,
+            "phase": "running",
+            "stop_policy": "explicit-controlled-stop",
+            "readiness": readiness,
+            "counts": {
+                "produced": int(actor.get("produced", 0)),
+                "accepted": int(distributor.get("accepted", 0)),
+                "acked": int(distributor.get("acked", 0)),
+                "final_drop": int(actor.get("final_drop", 0)),
             },
+            "train_updates": int(learner.get("train_updates", 0)),
+            "model_version": int(learner.get("model_version", 0)),
+            "monitor_url": None,
+            "ports": {},
             "internal_ports": {
                 "aiserver": 9002,
                 "local_sample_service": 9100,
@@ -2023,6 +1879,8 @@ class DockerRuntime:
                 "--env",
                 "RL_AISERVER_HOST=maze-aiserver",
                 "--env",
+                f"RL_EXPECTED_WORKLOAD={self.spec.mode}",
+                "--env",
                 f"RL_VALIDATION_ID={self.spec.run_id}",
                 "--env",
                 "RL_VIZ_OUTPUT_DIR=/opt/rl/maze-client/replays",
@@ -2073,6 +1931,20 @@ class DockerRuntime:
         }
 
     def stop(self) -> dict[str, Any]:
+        claim = self._acquire_lifecycle_lock(
+            blocking=True, operation="stop"
+        )
+        try:
+            # This runtime may have been constructed before a concurrent start
+            # finished. Reload the authoritative timeline after acquiring the
+            # shared lifecycle lock so the stop events append to, rather than
+            # overwrite, events committed by that start.
+            self._events = self._load_events()
+            return self._stop_claimed()
+        finally:
+            self._release_lifecycle_lock(claim)
+
+    def _stop_claimed(self) -> dict[str, Any]:
         self._record("stop_requested")
         try:
             self.stop_run(require_quiesce=self.spec.mode == "training")
@@ -2115,49 +1987,35 @@ class DockerRuntime:
         }
         metrics = {}
         readiness: dict[str, Any] = {}
+        actual_status = persisted.get("actual_status", "unknown")
         if self.spec.mode == "training" and containers["learner"].get("running"):
             try:
-                metrics = self._http_json(
-                    "http://127.0.0.1:9005/api/metrics/latest"
-                ).get("record", {})
+                metrics = self._container_metrics_latest()
             except RuntimeFailure:
                 metrics = {}
-            try:
-                container_metrics = self._container_metrics_latest()
-            except RuntimeFailure:
-                container_metrics = {}
             persisted_readiness = (
                 persisted.get("result", {}).get("readiness", {})
                 if isinstance(persisted.get("result"), dict)
                 else {}
             )
-            minimum_timestamp = max(
-                0.0,
-                float(persisted_readiness.get("timestamp", 0.0)) - 0.001,
-            )
-            readiness = training_record_readiness(
-                metrics,
-                minimum_timestamp=minimum_timestamp,
-                container_record=container_metrics,
-            )
-        actual_status = persisted.get("actual_status", "unknown")
-        if self.spec.mode == "training" and actual_status in {
-            "starting",
-            "ready",
-            "degraded",
-        }:
-            required_running = all(
+            core_healthy = all(
                 containers[role].get("running")
-                for role in ("learner", "aiserver")
+                and containers[role].get("health") == "healthy"
+                for role in ("learner", "aiserver", "client")
             )
-            client_failed = bool(
-                containers["client"].get("exists")
-                and not containers["client"].get("running")
-                and int(containers["client"].get("exit_code", 0)) != 0
+            launch_ready = (
+                actual_status == "ready"
+                and persisted_readiness.get("ready") is True
+                and persisted_readiness.get("client_session_policy_ready")
+                is True
             )
-            if required_running and readiness.get("ready") and not client_failed:
-                actual_status = "ready"
-            elif actual_status != "starting":
+            readiness = {
+                "ready": bool(launch_ready and core_healthy),
+                "source": "persisted-launch-readiness-and-container-health",
+                "observability_available": bool(metrics),
+            }
+        if self.spec.mode == "training" and actual_status == "ready":
+            if not readiness.get("ready", False):
                 actual_status = "degraded"
         return {
             "schema_version": 1,

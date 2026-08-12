@@ -47,17 +47,24 @@ Use an existing RunSpec:
 ./framework stop --run-spec run-spec.json --json
 ```
 
-Platform `start` returns after a fresh training workload, Sample Pool readiness,
-model version/checksum/ACK identity, and host/container Actor and Sample Pool
-stream identities converge; the containers keep running.
-`status` continuously projects runtime health, and `stop` can cancel a start that
-is still waiting for readiness. `local-test --profile training` remains the
-synchronous black-box acceptance path and also waits for Client completion,
-sample conservation, PPO updates, and model-artifact checks.
+Platform `start` returns after the Learner and AIServer Docker healthchecks pass
+and the Client has completed OpenSession, Init, first Training Assignment
+validation, and session-policy publication; an unavailable optional metrics snapshot does
+not block this launch/readiness result. The containers keep running. `status`
+continuously projects runtime health. `start` and `stop` serialize on the same
+per-Run lifecycle lock, so once `stop` returns no late readiness commit can
+recreate the run. `local-test --profile training` uses the same
+unbounded Training semantics: it returns a `launch_readiness` receipt after the
+core chain is ready, leaves the workload running, and requires the receipt's
+`stop_command` or an explicit `framework stop` for controlled shutdown. This
+launch receipt does not prove Client completion, sample conservation, PPO
+quality, or model-artifact acceptance.
 
 The default image tag is `training-001`. RunSpec v2 stores each role's image repository, tag, command, arguments, and CPU/memory/GPU limits, and requires AIServer and Client to share a host. Framework creates a dedicated Docker network and component directories for every Run. Task and Run identity remain in Docker labels and external receipts only.
 
-Training exposes only metrics port `9005` to the host; `9002/9100/9200` remain internal to the task network. Inference and model evaluation expose only replay port `9004`.
+The standard Framework Training path neither depends on nor reserves the
+optional metrics port `9005`; `9002/9100/9200` remain internal to the task
+network. Inference and model evaluation expose only replay port `9004`.
 
 ## Tests
 

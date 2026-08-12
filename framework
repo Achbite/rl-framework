@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import secrets
+import shlex
 import sys
 import time
 from datetime import datetime
@@ -176,8 +177,9 @@ def execute(args: argparse.Namespace) -> dict:
         spec = load_run_spec(str(spec_path))
         runtime = DockerRuntime(spec, runtime_scope="local-tests")
         started_at = time.time()
+        training_profile = args.profile == "training"
         try:
-            result = runtime.start(wait_for_completion=True)
+            result = runtime.start(wait_for_completion=not training_profile)
         except Exception as exc:
             runtime._atomic_json(
                 runtime.run_root / "acceptance.json",
@@ -196,23 +198,36 @@ def execute(args: argparse.Namespace) -> dict:
         acceptance = {
             "schema_version": 1,
             "ok": True,
+            "scope": (
+                "launch_readiness"
+                if training_profile
+                else "workload_completion"
+            ),
+            "workload_completed": not training_profile,
             "profile": args.profile,
             "task_id": spec.task_id,
             "run_id": spec.run_id,
             "started_at": started_at,
-            "completed_at": time.time(),
+            (
+                "readiness_at"
+                if training_profile
+                else "completed_at"
+            ): time.time(),
             "keep_running": bool(args.keep_running),
             "result": result,
         }
-        runtime._atomic_json(runtime.run_root / "acceptance.json", acceptance)
-        if not args.keep_running:
+        if not args.keep_running and not training_profile:
             acceptance["cleanup"] = runtime.stop()
             acceptance["cleaned_up"] = True
-            runtime._atomic_json(
-                runtime.run_root / "acceptance.json", acceptance
-            )
         else:
             acceptance["cleaned_up"] = False
+        if training_profile:
+            acceptance["stop_required"] = True
+            acceptance["stop_command"] = (
+                "./framework stop --run-spec "
+                + shlex.quote(str(spec.source_path))
+            )
+        runtime._atomic_json(runtime.run_root / "acceptance.json", acceptance)
         return acceptance
 
     spec = load_run_spec(args.run_spec)
