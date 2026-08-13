@@ -60,7 +60,7 @@ class RuntimePortTransportTest(unittest.TestCase):
             },
             server_pod_same_host="required",
             model_path=None,
-            initial_checkpoint=None,
+            initial_model_dir=None,
             source_path=Path(self.workspace.name) / "run.json",
         )
 
@@ -100,9 +100,9 @@ class RuntimePortTransportTest(unittest.TestCase):
         manifest = {
             "manifest_schema_version": 1,
             "package": "rl-smoke-model",
-            "version": "0.10.0",
+            "version": "0.11.0",
             "ready": True,
-            "model_file": "model_v000000.onnx",
+            "model_file": "SaveModel.onnx",
             "seed": 0,
             "identity": {
                 "artifact_digest": checksum,
@@ -116,8 +116,8 @@ class RuntimePortTransportTest(unittest.TestCase):
             manifest, checksum
         )
 
-        self.assertEqual(model_file, "model_v000000.onnx")
-        self.assertEqual(identity["package_version"], "0.10.0")
+        self.assertEqual(model_file, "SaveModel.onnx")
+        self.assertEqual(identity["package_version"], "0.11.0")
         self.assertEqual(identity["version"], 0)
         self.assertEqual(identity["sha256"], checksum)
         self.assertEqual(
@@ -132,7 +132,7 @@ class RuntimePortTransportTest(unittest.TestCase):
             DockerRuntime._embedded_smoke_model_identity(legacy, checksum)
 
         traversal = dict(manifest)
-        traversal["model_file"] = "../model_v000000.onnx"
+        traversal["model_file"] = "../SaveModel.onnx"
         with self.assertRaisesRegex(Exception, "manifest is invalid"):
             DockerRuntime._embedded_smoke_model_identity(
                 traversal, checksum
@@ -426,7 +426,7 @@ class RuntimePortTransportTest(unittest.TestCase):
                         "manifest_schema_version": 1,
                         "contract": {
                             "package_name": "rl-contracts",
-                            "package_version": "0.10.0",
+                            "package_version": "0.11.0",
                         },
                         "identity": {
                             "model_lineage_id": "maze-fixed-map-seed-0",
@@ -787,10 +787,13 @@ class RuntimePortTransportTest(unittest.TestCase):
         started = {}
         healthy_roles = []
 
-        def record_container(role, image_ref, arguments):
+        def record_container(
+            role, image_ref, arguments, command_arguments=None
+        ):
             started[role] = {
                 "image_ref": image_ref,
                 "arguments": arguments,
+                "command_arguments": command_arguments or [],
             }
             return f"{role}-id"
 
@@ -861,7 +864,14 @@ class RuntimePortTransportTest(unittest.TestCase):
         self.assertIn("RL_AISERVER_HOST=maze-aiserver", client_args)
         self.assertIn("RL_EXPECTED_WORKLOAD=training", client_args)
         self.assertNotIn("9004", client_args)
+        self.assertEqual(
+            started["learner"]["command_arguments"], ["--new-run"]
+        )
+        self.assertEqual(
+            started["aiserver"]["command_arguments"], ["--new-run"]
+        )
         self.assertEqual(result["ports"], {})
+        self.assertEqual(result["run_start_mode"], "new-run")
         self.assertEqual(
             result["internal_ports"]["local_sample_service"], 9100
         )
@@ -897,6 +907,143 @@ class RuntimePortTransportTest(unittest.TestCase):
         self.assertNotIn(
             "training_chain_ready",
             [call.args[0] for call in record.call_args_list],
+        )
+
+    def test_new_run_mounts_initial_model_directory_and_resets_components(self):
+        source = Path(self.workspace.name) / "source" / "000200"
+        source.mkdir(parents=True)
+        runtime = DockerRuntime(
+            replace(self.spec, initial_model_dir=str(source))
+        )
+        started = {}
+
+        def record_container(
+            role, image_ref, arguments, command_arguments=None
+        ):
+            started[role] = {
+                "arguments": arguments,
+                "command_arguments": command_arguments or [],
+            }
+            return f"{role}-id"
+
+        with (
+            mock.patch.object(
+                runtime, "_run_container", side_effect=record_container
+            ),
+            mock.patch.object(runtime, "_wait_healthy"),
+            mock.patch.object(
+                runtime, "_container_metrics_latest", return_value={}
+            ),
+        ):
+            result = runtime._start_training()
+
+        learner = started["learner"]
+        self.assertEqual(
+            learner["command_arguments"],
+            ["--new-run", "--initial-model-dir", "/opt/rl/learner/initial-model"],
+        )
+        self.assertIn(
+            f"{source.resolve()}:/opt/rl/learner/initial-model:ro",
+            learner["arguments"],
+        )
+        self.assertEqual(
+            started["aiserver"]["command_arguments"], ["--new-run"]
+        )
+        self.assertEqual(result["run_start_mode"], "new-run")
+
+    def test_same_run_resumes_without_external_model_or_new_run_reset(self):
+        missing_source = Path(self.workspace.name) / "removed-source"
+        runtime = DockerRuntime(
+            replace(self.spec, initial_model_dir=str(missing_source))
+        )
+        local_train = runtime.run_root / "learner-local-train"
+        (local_train / "runtime").mkdir(parents=True)
+        (local_train / "runtime/state.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+        started = {}
+
+        def record_container(
+            role, image_ref, arguments, command_arguments=None
+        ):
+            started[role] = {
+                "arguments": arguments,
+                "command_arguments": command_arguments or [],
+            }
+            return f"{role}-id"
+
+        with (
+            mock.patch.object(
+                runtime, "_run_container", side_effect=record_container
+            ),
+            mock.patch.object(runtime, "_wait_healthy"),
+            mock.patch.object(
+                runtime, "_container_metrics_latest", return_value={}
+            ),
+        ):
+            result = runtime._start_training()
+
+        self.assertEqual(started["learner"]["command_arguments"], [])
+        self.assertEqual(started["aiserver"]["command_arguments"], [])
+        self.assertNotIn(
+            "/opt/rl/learner/initial-model",
+            " ".join(started["learner"]["arguments"]),
+        )
+        self.assertEqual(result["run_start_mode"], "same-run-resume")
+
+    def test_preflight_does_not_reopen_external_source_for_same_run(self):
+        missing_source = Path(self.workspace.name) / "removed-source"
+        runtime = DockerRuntime(
+            replace(self.spec, initial_model_dir=str(missing_source))
+        )
+        local_train = runtime.run_root / "learner-local-train"
+        local_train.mkdir(parents=True)
+        (local_train / "resume-marker").write_text("1\n", encoding="utf-8")
+
+        def docker(arguments, **kwargs):
+            if arguments[0] == "info":
+                return mock.Mock(returncode=0, stdout='"26.0"\n', stderr="")
+            return mock.Mock(returncode=0, stdout="[]\n", stderr="")
+
+        with mock.patch.object(runtime, "_docker", side_effect=docker):
+            receipt = runtime.preflight()
+
+        self.assertEqual(
+            receipt["training_storage_mode"], "same-run-resume"
+        )
+        self.assertIsNone(receipt["initial_model_dir"])
+
+    def test_restart_preserves_prior_run_timeline(self):
+        runtime = DockerRuntime(self.spec)
+        runtime._record("training_chain_ready")
+        runtime._record("stopped")
+        restarted = DockerRuntime(self.spec)
+        with (
+            mock.patch.object(restarted, "preflight"),
+            mock.patch.object(
+                restarted, "_managed_containers", return_value=[]
+            ),
+            mock.patch.object(restarted, "_assert_host_ports_available"),
+            mock.patch.object(restarted, "_ensure_network"),
+            mock.patch.object(
+                restarted,
+                "_start_training",
+                return_value={"actual_status": "ready"},
+            ),
+        ):
+            restarted.start()
+
+        timeline = json.loads(
+            (restarted.run_root / "timeline.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [event["state"] for event in timeline["events"]],
+            [
+                "training_chain_ready",
+                "stopped",
+                "restart_requested",
+                "preflight_complete",
+            ],
         )
 
     def test_start_refuses_to_implicitly_stop_an_active_training_run(self):

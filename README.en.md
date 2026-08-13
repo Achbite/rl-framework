@@ -1,35 +1,128 @@
 # RL Training Framework
 
-English | [简体中文](README.md)
+[简体中文](README.md) | English
 
-Starts and checks the local Learner, AIServer, and Maze Client as one workflow. Component images are built by their own repositories; this repository only provides local Docker orchestration.
+This repository is the single local entry point for the RL framework. Run the commands below from the directory that contains all eight repositories.
 
-## Quick Start
+## 1. Prerequisites
 
-Run the inference communication and replay smoke test:
+Install Git, Python 3, and Docker. On macOS, start Colima first.
 
 ```bash
+docker version
+python3 --version
+```
+
+Expected layout:
+
+```text
+RL-Training-Framework/
+  rl-contracts/
+  rl-sample-pool/
+  rl-model-distributor/
+  rl-learner/
+  rl-aiserver/
+  maze-client/
+  rl-framework/
+  rl-infra/
+```
+
+Repositories must be reviewed, committed, and clean before their first immutable artifact is created.
+
+## 2. Build artifacts and images
+
+Run these commands in order:
+
+```bash
+cd /absolute/path/RL-Training-Framework
+
+(cd rl-contracts && bash build_artifact.sh)
+(cd rl-sample-pool && bash build_artifact.sh)
+(cd rl-model-distributor && bash build_artifact.sh)
+
+(cd rl-learner && bash scripts/sync_runtime_artifacts.sh)
+(cd rl-learner && RL_LEARNER_IMAGE_TAG=training-001 bash build_image.sh)
+
+(cd rl-aiserver && bash scripts/sync_contract_snapshot.sh)
+(cd rl-aiserver && RL_AISERVER_IMAGE_TAG=training-001 bash build_image.sh)
+
+(cd maze-client && bash scripts/sync_contract_snapshot.sh)
+(cd maze-client && RL_CLIENT_IMAGE_TAG=training-001 bash build_image.sh)
+```
+
+Verify the runtime images:
+
+```bash
+docker image inspect \
+  rl-training/learner:training-001 \
+  rl-training/aiserver:training-001 \
+  rl-training/maze-client:training-001
+```
+
+## 3. Verify the inference chain
+
+```bash
+cd rl-framework
 ./framework local-test --profile local-test --json
 ```
 
-Run the local four-agent training loop:
+The command waits for the inference workload to finish and then removes its containers. Only `ok:true` means that workload completed.
+
+## 4. Start local training
 
 ```bash
 ./framework local-test --profile training --json
 ```
 
-Components clear their own `local-train` directories and start from zero by default. Initialize from an explicit complete checkpoint with:
+Training has no total-sample hard limit. The command returns after Learner, AIServer, and Client become ready while training continues. The JSON response includes:
+
+- `run_id`, the Run identity;
+- `stop_command`, the exact command that stops this Run;
+- `scope: launch_readiness`, which means the chain is ready, not that training quality passed.
+
+Copy and run `stop_command` when training should end. You can also use its RunSpec path:
+
+```bash
+./framework status --run-spec /absolute/path/run-spec.json --json
+./framework stop --run-spec /absolute/path/run-spec.json --json
+```
+
+Standard Framework Training does not publish host port `9005`; use `framework status` for runtime state. See [rl-learner/README.en.md](../rl-learner/README.en.md) for the Learner-only development monitor.
+
+## 5. Resume the same Run
+
+A normal stop preserves the Learner archive and AIServer cache. Restart with the original RunSpec:
+
+```bash
+./framework start --run-spec /absolute/path/run-spec.json --json
+```
+
+Learner restores the model, optimizer, RNG, update count, and sample count. AIServer validates and reuses its cache. Do not pass the initial model directory again.
+
+## 6. Start a new Run from an existing model
+
+The initial directory must contain exactly four files:
+
+```text
+000200/
+  SaveModel.onnx
+  checkpoint.pt
+  manifest.json
+  metadata.json
+```
+
+Start the Run:
 
 ```bash
 ./framework local-test \
   --profile training \
-  --initial-checkpoint /absolute/path/checkpoint_v000200.pt \
+  --initial-model-dir /absolute/path/archive/000200 \
   --json
 ```
 
-Evaluate an explicit savepoint locally. The model filename inside the directory
-is fixed as `SaveModel.onnx`; AIServer reads it from its configured
-`model.evaluation_dir`:
+The new Run inherits only model weights and provenance. Its lineage, model version, optimizer, RNG, update count, and sample count start from zero.
+
+## 7. Evaluate a local model
 
 ```bash
 ./framework local-test \
@@ -38,7 +131,9 @@ is fixed as `SaveModel.onnx`; AIServer reads it from its configured
   --json
 ```
 
-Use an existing RunSpec:
+`--model-path` may name the savepoint directory or its `SaveModel.onnx`. Evaluation is a separate local mode and never enters the training chain.
+
+## 8. Use a fixed RunSpec
 
 ```bash
 ./framework preflight --run-spec run-spec.json --json
@@ -47,29 +142,22 @@ Use an existing RunSpec:
 ./framework stop --run-spec run-spec.json --json
 ```
 
-Platform `start` returns after the Learner and AIServer Docker healthchecks pass
-and the Client has completed OpenSession, Init, first Training Assignment
-validation, and session-policy publication; an unavailable optional metrics snapshot does
-not block this launch/readiness result. The containers keep running. `status`
-continuously projects runtime health. `start` and `stop` serialize on the same
-per-Run lifecycle lock, so once `stop` returns no late readiness commit can
-recreate the run. `local-test --profile training` uses the same
-unbounded Training semantics: it returns a `launch_readiness` receipt after the
-core chain is ready, leaves the workload running, and requires the receipt's
-`stop_command` or an explicit `framework stop` for controlled shutdown. This
-launch receipt does not prove Client completion, sample conservation, PPO
-quality, or model-artifact acceptance.
+RunSpec must use `schema_version: 2`. Training uses exactly four Agents, and the first Learner and AIServer arguments must both be `training`.
 
-The default image tag is `training-001`. RunSpec v2 stores each role's image repository, tag, command, arguments, and CPU/memory/GPU limits, and requires AIServer and Client to share a host. Framework creates a dedicated Docker network and component directories for every Run. Task and Run identity remain in Docker labels and external receipts only.
+## 9. Troubleshooting
 
-The standard Framework Training path neither depends on nor reserves the
-optional metrics port `9005`; `9002/9100/9200` remain internal to the task
-network. Inference and model evaluation expose only replay port `9004`.
+| Error | Fix |
+| --- | --- |
+| `refusing to create ... from a dirty worktree` | Review and commit that repository before creating the immutable artifact |
+| `Contract metric schema artifact is missing` | Rebuild Contracts 0.11.0 and resync downstream snapshots and artifacts |
+| `runtime artifacts do not match artifact_versions.env` | Rebuild Sample Pool and Model Distributor, then rerun the Learner sync script |
+| Docker image not found | Repeat the three image builds in section 2 |
+| `address already in use` | Stop the old workload using replay port `9004`; Training ports stay inside the task network |
 
-## Tests
+## 10. Test Framework
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_*.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
 ## License

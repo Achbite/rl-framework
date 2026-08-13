@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
             "SaveModel.onnx file"
         ),
     )
-    local.add_argument("--initial-checkpoint")
+    local.add_argument("--initial-model-dir")
     local.add_argument("--keep-running", action="store_true")
     add_output_option(local)
     return parser
@@ -96,9 +96,9 @@ def local_test_spec(args: argparse.Namespace) -> Path:
         raise SpecError("agents, episodes, and max-steps must be positive")
     if args.profile == "model-evaluation" and not args.model_path:
         raise SpecError("--model-path is required for model-evaluation")
-    if args.initial_checkpoint and args.profile != "training":
+    if args.initial_model_dir and args.profile != "training":
         raise SpecError(
-            "--initial-checkpoint is supported only for training"
+            "--initial-model-dir is supported only for training"
         )
 
     timestamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
@@ -150,9 +150,9 @@ def local_test_spec(args: argparse.Namespace) -> Path:
         document["model_path"] = str(
             Path(args.model_path).expanduser().resolve()
         )
-    if args.initial_checkpoint:
-        document["initial_checkpoint"] = str(
-            Path(args.initial_checkpoint).expanduser().resolve()
+    if args.initial_model_dir:
+        document["initial_model_dir"] = str(
+            Path(args.initial_model_dir).expanduser().resolve()
         )
 
     run_root = (

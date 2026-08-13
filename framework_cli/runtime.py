@@ -369,7 +369,7 @@ class DockerRuntime:
             or not isinstance(model_file, str)
             or not model_file
             or Path(model_file).name != model_file
-            or not model_file.endswith(".onnx")
+            or model_file != EVALUATION_MODEL_FILE
         ):
             raise RuntimeFailure("embedded smoke model manifest is invalid")
         artifact_digest = identity.get("artifact_digest")
@@ -411,7 +411,7 @@ class DockerRuntime:
             manifest.get("manifest_schema_version") != 1
             or not isinstance(contract, dict)
             or contract.get("package_name") != "rl-contracts"
-            or contract.get("package_version") != "0.10.0"
+            or contract.get("package_version") != "0.11.0"
             or not isinstance(identity, dict)
             or identity.get("model_version") != version
             or identity.get("artifact_digest") != checksum
@@ -546,6 +546,26 @@ class DockerRuntime:
         }
         self._atomic_json(self.run_root / "state.json", document)
 
+    def _training_storage_mode(self) -> str:
+        local_train = self.run_root / "learner-local-train"
+        if local_train.is_symlink():
+            raise RuntimeFailure(
+                "run-scoped learner local-train must not be a symbolic link"
+            )
+        if not local_train.exists():
+            return "new-run"
+        if not local_train.is_dir():
+            raise RuntimeFailure(
+                "run-scoped learner local-train must be a directory"
+            )
+        try:
+            occupied = next(local_train.iterdir(), None) is not None
+        except OSError as exc:
+            raise RuntimeFailure(
+                f"cannot inspect run-scoped learner local-train: {exc}"
+            ) from exc
+        return "same-run-resume" if occupied else "new-run"
+
     def preflight(self) -> dict[str, Any]:
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         info = self._docker(
@@ -559,14 +579,30 @@ class DockerRuntime:
             )
             model_path = str(candidate)
             model_savepoint = str(savepoint)
-        initial_checkpoint = None
-        if self.spec.initial_checkpoint:
-            candidate = Path(self.spec.initial_checkpoint)
-            if not candidate.is_file():
-                raise RuntimeFailure(
-                    f"initial checkpoint does not exist: {candidate}"
-                )
-            initial_checkpoint = str(candidate)
+        training_storage_mode = None
+        initial_model_dir = None
+        if self.spec.mode == "training":
+            training_storage_mode = self._training_storage_mode()
+            if (
+                training_storage_mode == "new-run"
+                and self.spec.initial_model_dir
+            ):
+                candidate = Path(self.spec.initial_model_dir)
+                if candidate.is_symlink() or not candidate.is_dir():
+                    raise RuntimeFailure(
+                        "initial model directory does not exist or is a "
+                        f"symbolic link: {candidate}"
+                    )
+                candidate = candidate.resolve()
+                local_train = (
+                    self.run_root / "learner-local-train"
+                ).resolve()
+                if candidate == local_train or local_train in candidate.parents:
+                    raise RuntimeFailure(
+                        "initial model directory must be outside the "
+                        "run-scoped learner local-train directory"
+                    )
+                initial_model_dir = str(candidate)
         images = {}
         for role in ("learner", "aiserver", "client"):
             image_ref = self.spec.image_ref(role)
@@ -600,7 +636,8 @@ class DockerRuntime:
             "images": images,
             "model_path": model_path,
             "model_savepoint": model_savepoint,
-            "initial_checkpoint": initial_checkpoint,
+            "training_storage_mode": training_storage_mode,
+            "initial_model_dir": initial_model_dir,
         }
 
     def _ensure_network(self) -> None:
@@ -786,6 +823,7 @@ class DockerRuntime:
         role: str,
         image_ref: str,
         arguments: list[str],
+        command_arguments: list[str] | None = None,
     ) -> str:
         name = self._name(role)
         component = self.spec.components[role]
@@ -814,6 +852,7 @@ class DockerRuntime:
             *arguments,
             image_ref,
             *component.args,
+            *(command_arguments or []),
         ]
         result = self._docker(command, timeout=120)
         return result.stdout.strip()
@@ -1599,7 +1638,9 @@ class DockerRuntime:
             )
         if existing:
             self.stop_run()
-        self._events = []
+        self._events = self._load_events()
+        if self._events:
+            self._record("restart_requested")
         self._record("preflight_complete")
         self._write_state("starting")
         required_ports = {
@@ -1658,6 +1699,9 @@ class DockerRuntime:
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
+        storage_mode = self._training_storage_mode()
+        new_run = storage_mode == "new-run"
+
         learner_arguments = [
             *self._base_env(),
             "--env",
@@ -1678,27 +1722,24 @@ class DockerRuntime:
             learner_arguments.extend(
                 ["--env", "RL_ARCHIVE_INTERVAL_UPDATES=2"]
             )
-        if self.spec.initial_checkpoint:
-            checkpoint = Path(self.spec.initial_checkpoint)
-            container_checkpoint = (
-                "/opt/rl/learner/initial-checkpoint/"
-                f"{checkpoint.name}"
-            )
+        learner_command_arguments = ["--new-run"] if new_run else []
+        if new_run and self.spec.initial_model_dir:
+            initial_model_dir = Path(self.spec.initial_model_dir).resolve()
+            container_model_dir = "/opt/rl/learner/initial-model"
             learner_arguments.extend(
                 [
                     "--volume",
-                    (
-                        f"{checkpoint.parent}:"
-                        "/opt/rl/learner/initial-checkpoint:ro"
-                    ),
-                    "--env",
-                    f"RL_INITIAL_CHECKPOINT={container_checkpoint}",
+                    f"{initial_model_dir}:{container_model_dir}:ro",
                 ]
+            )
+            learner_command_arguments.extend(
+                ["--initial-model-dir", container_model_dir]
             )
         self._run_container(
             "learner",
             self.spec.image_ref("learner"),
             learner_arguments,
+            learner_command_arguments,
         )
         self._wait_healthy("learner", 180)
 
@@ -1721,6 +1762,7 @@ class DockerRuntime:
                     "/opt/rl/aiserver/models/local-train"
                 ),
             ],
+            ["--new-run"] if new_run else [],
         )
         self._wait_healthy("aiserver", 60)
         self._record("model_v0_loaded_ack")
@@ -1769,6 +1811,7 @@ class DockerRuntime:
             "mode": self.spec.mode,
             "actual_status": "ready",
             "phase": "running",
+            "run_start_mode": storage_mode,
             "stop_policy": "explicit-controlled-stop",
             "readiness": readiness,
             "counts": {

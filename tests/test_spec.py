@@ -116,13 +116,13 @@ class RunSpecTest(unittest.TestCase):
                 ):
                     load_run_spec(str(self.write(document)))
 
-    def test_initial_checkpoint_is_explicit_and_training_only(self):
+    def test_initial_model_directory_is_explicit_and_training_only(self):
         document = self.baseline()
-        document["initial_checkpoint"] = "/tmp/checkpoint.pt"
+        document["initial_model_dir"] = "/tmp/archive/000200"
         spec = load_run_spec(str(self.write(document)))
         self.assertEqual(
-            spec.initial_checkpoint,
-            str(Path("/tmp/checkpoint.pt").resolve()),
+            spec.initial_model_dir,
+            str(Path("/tmp/archive/000200").resolve()),
         )
 
         document["mode"] = "local-test"
@@ -132,10 +132,16 @@ class RunSpecTest(unittest.TestCase):
         ):
             load_run_spec(str(self.write(document)))
 
+    def test_removed_initial_checkpoint_is_rejected(self):
+        document = self.baseline()
+        document["initial_checkpoint"] = "/tmp/checkpoint.pt"
+        with self.assertRaisesRegex(SpecError, "use initial_model_dir"):
+            load_run_spec(str(self.write(document)))
+
     def test_removed_resume_from_is_rejected(self):
         document = self.baseline()
         document["resume_from"] = "/tmp/savepoint"
-        with self.assertRaisesRegex(SpecError, "was removed"):
+        with self.assertRaisesRegex(SpecError, "resumes automatically"):
             load_run_spec(str(self.write(document)))
 
     def test_rejects_full_image_reference(self):

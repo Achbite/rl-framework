@@ -74,7 +74,7 @@ class RunSpec:
     components: dict[str, ComponentSpec]
     server_pod_same_host: str
     model_path: str | None
-    initial_checkpoint: str | None
+    initial_model_dir: str | None
     source_path: Path
 
     def image_ref(self, role: str) -> str:
@@ -235,25 +235,29 @@ def load_run_spec(path: str) -> RunSpec:
     elif model_path is not None and not isinstance(model_path, str):
         raise SpecError("model_path must be a string")
 
-    initial_checkpoint = document.get("initial_checkpoint")
-    if initial_checkpoint is not None:
+    initial_model_dir = document.get("initial_model_dir")
+    if initial_model_dir is not None:
         if mode != "training":
             raise SpecError(
-                "initial_checkpoint is supported only for training"
+                "initial_model_dir is supported only for training"
             )
         if (
-            not isinstance(initial_checkpoint, str)
-            or not initial_checkpoint
+            not isinstance(initial_model_dir, str)
+            or not initial_model_dir
         ):
             raise SpecError(
-                "initial_checkpoint must be a non-empty path"
+                "initial_model_dir must be a non-empty path"
             )
-        initial_checkpoint = str(
-            Path(initial_checkpoint).expanduser().resolve()
+        initial_model_dir = str(
+            Path(initial_model_dir).expanduser().resolve()
+        )
+    if "initial_checkpoint" in document:
+        raise SpecError(
+            "initial_checkpoint was removed; use initial_model_dir"
         )
     if "resume_from" in document:
         raise SpecError(
-            "resume_from was removed; use initial_checkpoint"
+            "resume_from was removed; the same run_id resumes automatically"
         )
 
     return RunSpec(
@@ -268,6 +272,6 @@ def load_run_spec(path: str) -> RunSpec:
         components=components,
         server_pod_same_host=server_pod_same_host,
         model_path=model_path,
-        initial_checkpoint=initial_checkpoint,
+        initial_model_dir=initial_model_dir,
         source_path=source,
     )
