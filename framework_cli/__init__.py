@@ -1,1 +1,1 @@
-"""Local integration runtime for the RL training repositories."""
+"""Read-only diagnostics for the RL training repositories."""
