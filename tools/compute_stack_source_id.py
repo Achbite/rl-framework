@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 PLATFORM = "linux/arm64"
 PLATFORM_DIRECTORY = "linux-arm64"
 REPOSITORIES = (

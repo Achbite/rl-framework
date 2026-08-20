@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Optional, Union
 
 
 SCHEMA_VERSION = 1
-CONTRACTS_VERSION = "0.13.0"
+CONTRACTS_VERSION = "0.14.0"
 ARTIFACT_PLATFORM = "linux/arm64"
 PLATFORM_DIRECTORY = "linux-arm64"
 
