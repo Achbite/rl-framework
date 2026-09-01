@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import re
 import stat
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -13,7 +11,7 @@ from typing import Any, Callable, Iterable, Optional, Union
 
 
 SCHEMA_VERSION = 1
-CONTRACTS_VERSION = "0.14.0"
+CONTRACTS_VERSION = "0.15.0"
 ARTIFACT_PLATFORM = "linux/arm64"
 PLATFORM_DIRECTORY = "linux-arm64"
 
@@ -28,48 +26,60 @@ REPOSITORIES = (
     "rl-infra",
 )
 
-ARTIFACTS = (
-    ("rl-contracts", 2),
-    ("rl-sample-pool", 1),
-    ("rl-model-distributor", 1),
-)
+ARTIFACT_SCHEMA = "rl.artifact-manifest.v1"
+ARTIFACTS = {
+    "rl-training-contracts": {
+        "storage_package": "rl-contracts",
+        "storage_suffix": ("training",),
+        "platform": None,
+        "required_files": {
+            "common.proto",
+            "training.proto",
+            "training_metrics.proto",
+            "cpp/common.pb.cc",
+            "cpp/training.pb.cc",
+            "cpp/training.grpc.pb.cc",
+            "cpp/training_metrics.pb.cc",
+            "python/common_pb2.py",
+            "python/training_pb2.py",
+            "python/training_pb2_grpc.py",
+            "python/training_metrics_pb2.py",
+            "schemas/training.metrics.json",
+        },
+        "required_executables": set(),
+    },
+    "rl-sample-pool": {
+        "storage_package": "rl-sample-pool",
+        "storage_suffix": (PLATFORM_DIRECTORY,),
+        "platform": ARTIFACT_PLATFORM,
+        "required_files": {
+            "bin/maze_sample_pool",
+            "config/pool_config.yaml",
+        },
+        "required_executables": {"bin/maze_sample_pool"},
+    },
+    "rl-model-distributor": {
+        "storage_package": "rl-model-distributor",
+        "storage_suffix": (PLATFORM_DIRECTORY,),
+        "platform": ARTIFACT_PLATFORM,
+        "required_files": {
+            "bin/maze_model_distributor",
+            "config/model_distributor_config.yaml",
+        },
+        "required_executables": {"bin/maze_model_distributor"},
+    },
+}
 
 IMAGE_COMPONENTS = {
     "learner": "learner",
     "aiserver": "aiserver",
-    "client": "maze-client",
+    "client": "client",
 }
 
-IMAGE_RUNTIME_CONTRACTS = {
-    "learner": {
-        "entrypoint": ["/opt/rl/learner/scripts/entrypoint.sh"],
-        "cmd": ["--config", "configs/learner_config.yaml"],
-    },
-    "aiserver": {
-        "entrypoint": ["/opt/rl/aiserver/scripts/entrypoint.sh"],
-        "cmd": ["--config", "configs/server_config.yaml"],
-    },
-    "client": {
-        "entrypoint": ["/opt/rl/maze-client/scripts/entrypoint.sh"],
-        "cmd": ["--config", "configs/client_config.yaml"],
-    },
-}
-
-IMAGE_IDENTITY_LABELS = {
+IMAGE_LABELS = {
     "component": "org.rl-training.component",
-    "component_commit": "org.rl-training.component-commit",
-    "stack_source_id": "org.rl-training.stack-source-id",
-    "contracts_version": "org.rl-training.contracts-version",
-    "contracts_artifact_digest":
-        "org.rl-training.contracts-artifact-digest",
-    "contracts_manifest_digest":
-        "org.rl-training.contracts-manifest-digest",
-    "component_config_digest":
-        "org.rl-training.component-config-digest",
+    "project_image_tag": "org.rl-training.project-image-tag",
 }
-
-_LOWER_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_GIT_COMMIT = re.compile(r"^[0-9a-f]{12,40}$")
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -101,17 +111,6 @@ def parameter_error(scope: str, message: str) -> dict[str, Any]:
 
 def _run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, **kwargs)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while True:
-            block = source.read(1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _regular_file(path: Path) -> bool:
@@ -236,28 +235,21 @@ def _load_manifest(
     return document, None
 
 
-def _digest_identity(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and value.get("algorithm") == "sha256"
-        and isinstance(value.get("hex"), str)
-        and _LOWER_SHA256.fullmatch(value["hex"]) is not None
-    )
-
-
 def _verify_artifact(
     root: Path,
     package: str,
-    expected_schema: int,
+    contract_reference: dict[str, str],
 ) -> tuple[dict[str, Any], list[str]]:
+    specification = ARTIFACTS[package]
     artifact_root = (
         root
         / ".workspace"
         / "artifacts"
-        / package
+        / specification["storage_package"]
         / CONTRACTS_VERSION
-        / PLATFORM_DIRECTORY
     )
+    for relative in specification["storage_suffix"]:
+        artifact_root /= relative
     manifest_path = artifact_root / "manifest.json"
     document, load_error = _load_manifest(manifest_path)
     failures: list[str] = []
@@ -272,103 +264,84 @@ def _verify_artifact(
         output["error"] = failures[-1]
         return output, failures
 
-    for key, expected in (
-        ("schema_version", expected_schema),
+    expected_identity = [
+        ("schema_version", ARTIFACT_SCHEMA),
+        ("artifact_channel", "production"),
         ("package", package),
         ("version", CONTRACTS_VERSION),
-        ("platform", ARTIFACT_PLATFORM),
-    ):
+    ]
+    if specification["platform"] is not None:
+        expected_identity.append(("platform", specification["platform"]))
+    for key, expected in expected_identity:
         if document.get(key) != expected:
             failures.append(
                 f"{package} manifest {key} mismatch: "
                 f"expected {expected!r}, found {document.get(key)!r}"
             )
 
-    source_commit = document.get("source_commit")
-    source_id = document.get("source_id")
-    if not isinstance(source_commit, str) or not _GIT_COMMIT.fullmatch(
-        source_commit
-    ):
-        failures.append(f"{package} source_commit is invalid")
-    if not isinstance(source_id, str) or not source_id:
-        failures.append(f"{package} source_id is missing")
-
-    source_identity: dict[str, Any] = {
-        "commit": source_commit,
-        "id": source_id,
-    }
-    if package == "rl-contracts":
-        source_identity["digest"] = document.get("source_digest")
-        source_identity["tree_state"] = document.get("source_tree_state")
-        if not _digest_identity(document.get("source_digest")):
-            failures.append("rl-contracts source_digest is invalid")
-        if document.get("source_tree_state") != "clean":
-            failures.append("rl-contracts artifact is not from clean source")
-    else:
-        source_identity["sha256"] = document.get("source_sha256")
-        if not isinstance(document.get("source_sha256"), str) or not _LOWER_SHA256.fullmatch(
-            document["source_sha256"]
-        ):
-            failures.append(f"{package} source_sha256 is invalid")
-        contract = document.get("contract")
-        if not isinstance(contract, dict):
-            failures.append(f"{package} embedded contract identity is missing")
-        else:
-            if contract.get("version") != CONTRACTS_VERSION:
-                failures.append(f"{package} embeds the wrong Contracts version")
-            if contract.get("platform") != ARTIFACT_PLATFORM:
-                failures.append(f"{package} embeds the wrong Contracts platform")
-            if not _digest_identity(contract.get("artifact_digest")):
-                failures.append(f"{package} contract artifact digest is invalid")
-
     files = document.get("files")
     verified_files: dict[str, Any] = {}
-    if not isinstance(files, dict) or not files:
-        failures.append(f"{package} files table is empty or invalid")
+    if (
+        not isinstance(files, list)
+        or not files
+        or not all(isinstance(relative, str) for relative in files)
+    ):
+        failures.append(f"{package} files list is empty or invalid")
     else:
-        for relative, expected_digest in sorted(files.items()):
+        declared = set(files)
+        required_files = ARTIFACTS[package]["required_files"]
+        missing = required_files - declared
+        if missing:
+            failures.append(
+                f"{package} does not declare required files: {sorted(missing)}"
+            )
+        for relative in sorted(declared):
             if not _safe_artifact_path(relative):
                 failures.append(f"{package} contains unsafe path: {relative!r}")
                 continue
             path = artifact_root / PurePosixPath(relative)
-            if not isinstance(expected_digest, str) or not _LOWER_SHA256.fullmatch(
-                expected_digest
-            ):
-                failures.append(f"{package} has invalid digest for {relative}")
-                continue
             if not _regular_file(path):
                 failures.append(f"{package} file is missing: {relative}")
                 continue
-            actual_digest = _sha256(path)
             verified_files[relative] = {
-                "sha256": actual_digest,
                 "size_bytes": path.stat().st_size,
-                "matches_manifest": actual_digest == expected_digest,
             }
-            if actual_digest != expected_digest:
-                failures.append(f"{package} file digest mismatch: {relative}")
-
-    if package == "rl-contracts":
-        canonical_files = json.dumps(
-            files if isinstance(files, dict) else {},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        expected_artifact_digest = hashlib.sha256(canonical_files).hexdigest()
-        if document.get("artifact_digest") != {
-            "algorithm": "sha256",
-            "hex": expected_artifact_digest,
-        }:
-            failures.append("rl-contracts artifact_digest is invalid")
+        required_executables = ARTIFACTS[package]["required_executables"]
+        manifest_executables = document.get("executables", [])
+        if package != "rl-training-contracts":
+            embedded_contract = document.get("contract")
+            if not isinstance(embedded_contract, dict) or any(
+                embedded_contract.get(key) != expected
+                for key, expected in contract_reference.items()
+            ):
+                failures.append(
+                    f"{package} uses an incompatible Contracts package"
+                )
+            if (
+                not isinstance(manifest_executables, list)
+                or not all(
+                    isinstance(relative, str)
+                    for relative in manifest_executables
+                )
+                or not required_executables.issubset(
+                    set(manifest_executables)
+                )
+            ):
+                failures.append(
+                    f"{package} executable declaration is incomplete"
+                )
+        for relative in required_executables:
+            path = artifact_root / PurePosixPath(relative)
+            if not _regular_file(path) or not os.access(path, os.X_OK):
+                failures.append(
+                    f"{package} executable is missing or not executable: {relative}"
+                )
 
     output.update(
         {
             "ok": not failures,
             "version": document.get("version"),
             "platform": document.get("platform"),
-            "source": source_identity,
-            "manifest_sha256": _sha256(manifest_path),
-            "artifact_digest": document.get("artifact_digest"),
             "contract": document.get("contract"),
             "files": verified_files,
         }
@@ -382,31 +355,16 @@ def doctor_artifacts(root: Optional[Path] = None) -> dict[str, Any]:
     root = (root or workspace_root()).absolute()
     artifacts: dict[str, Any] = {}
     failures: list[str] = []
-    for package, schema_version in ARTIFACTS:
+    contract_reference = {
+        "package": "rl-training-contracts",
+        "version": CONTRACTS_VERSION,
+    }
+    for package in ARTIFACTS:
         inspected, package_failures = _verify_artifact(
-            root, package, schema_version
+            root, package, contract_reference
         )
         artifacts[package] = inspected
         failures.extend(package_failures)
-
-    contracts_digest = (
-        artifacts.get("rl-contracts", {})
-        .get("artifact_digest", {})
-        .get("hex")
-    )
-    if contracts_digest:
-        for package in ("rl-sample-pool", "rl-model-distributor"):
-            embedded = (
-                artifacts.get(package, {})
-                .get("contract", {})
-                .get("artifact_digest", {})
-                .get("hex")
-            )
-            if embedded != contracts_digest:
-                message = f"{package} is not bound to the selected Contracts artifact"
-                failures.append(message)
-                artifacts[package]["ok"] = False
-                artifacts[package]["error"] = message
 
     return result(
         "artifacts",
@@ -414,7 +372,7 @@ def doctor_artifacts(root: Optional[Path] = None) -> dict[str, Any]:
         {
             "workspace_root": str(root),
             "required_version": CONTRACTS_VERSION,
-            "required_platform": ARTIFACT_PLATFORM,
+            "required_binary_platform": ARTIFACT_PLATFORM,
             "artifacts": artifacts,
         },
         error="; ".join(failures) if failures else None,
@@ -425,8 +383,6 @@ def doctor_model(model: Union[str, os.PathLike[str]]) -> dict[str, Any]:
     requested = Path(model).expanduser()
     path = Path(os.path.abspath(requested))
     failures: list[str] = []
-    if path.name != "SaveModel.onnx":
-        failures.append("model filename must be exactly SaveModel.onnx")
     if path.is_symlink():
         failures.append("model must not be a symbolic link")
     if not _regular_file(path):
@@ -440,7 +396,7 @@ def doctor_model(model: Union[str, os.PathLike[str]]) -> dict[str, Any]:
     }
     if not failures:
         size = path.stat().st_size
-        data.update({"size_bytes": size, "sha256": _sha256(path)})
+        data["size_bytes"] = size
         if size <= 0:
             failures.append("model file is empty")
 
@@ -491,83 +447,36 @@ def _inspect_image(
 
     document = documents[0]
     image_id = document.get("Id")
-    repo_digests = document.get("RepoDigests") or []
     image_config = document.get("Config") or {}
     labels = image_config.get("Labels") or {}
-    if not isinstance(image_id, str) or not image_id.startswith("sha256:") or not _LOWER_SHA256.fullmatch(
-        image_id.removeprefix("sha256:")
-    ):
-        failures.append(f"{role} image ID is invalid")
-    if not isinstance(repo_digests, list) or not all(
-        isinstance(value, str) for value in repo_digests
-    ):
-        failures.append(f"{role} RepoDigests is invalid")
-        repo_digests = []
     if not isinstance(labels, dict):
         failures.append(f"{role} image labels are invalid")
         labels = {}
 
-    runtime_contract = IMAGE_RUNTIME_CONTRACTS[role]
     entrypoint = image_config.get("Entrypoint")
     command = image_config.get("Cmd")
-    if entrypoint != runtime_contract["entrypoint"]:
-        failures.append(f"{role} image ENTRYPOINT is missing or incorrect")
-    if command != runtime_contract["cmd"]:
-        failures.append(f"{role} image CMD is missing or incorrect")
+    if not entrypoint and not command:
+        failures.append(f"{role} image has no executable ENTRYPOINT or CMD")
 
-    identity_labels = {
+    runtime_labels = {
         logical: labels.get(key)
-        for logical, key in IMAGE_IDENTITY_LABELS.items()
+        for logical, key in IMAGE_LABELS.items()
     }
     expected_component = IMAGE_COMPONENTS[role]
-    if identity_labels["component"] != expected_component:
+    if runtime_labels["component"] != expected_component:
         failures.append(f"{role} image component label is missing or incorrect")
-    if not isinstance(identity_labels["component_commit"], str) or not _GIT_COMMIT.fullmatch(
-        identity_labels["component_commit"]
+    if not isinstance(runtime_labels["project_image_tag"], str) or not (
+        runtime_labels["project_image_tag"]
     ):
-        failures.append(f"{role} component commit label is invalid")
-    if identity_labels["contracts_version"] != CONTRACTS_VERSION:
-        failures.append(f"{role} Contracts version label is invalid")
-    if not isinstance(identity_labels["contracts_artifact_digest"], str) or not _LOWER_SHA256.fullmatch(
-        identity_labels["contracts_artifact_digest"]
-    ):
-        failures.append(f"{role} Contracts artifact label is invalid")
-    if not isinstance(identity_labels["contracts_manifest_digest"], str) or not _LOWER_SHA256.fullmatch(
-        identity_labels["contracts_manifest_digest"]
-    ):
-        failures.append(f"{role} Contracts manifest label is invalid")
-    if not isinstance(identity_labels["component_config_digest"], str) or not _LOWER_SHA256.fullmatch(
-        identity_labels["component_config_digest"]
-    ):
-        failures.append(f"{role} component config label is invalid")
-    if not isinstance(identity_labels["stack_source_id"], str) or not _LOWER_SHA256.fullmatch(
-        identity_labels["stack_source_id"]
-    ):
-        failures.append(f"{role} stack source label is invalid")
-
-    assembly_labels = {
-        key: value
-        for key, value in labels.items()
-        if isinstance(key, str) and key.startswith("org.rl-training.")
-    }
-    if role == "learner":
-        for dependency in ("sample-pool", "model-distributor"):
-            key = f"org.rl-training.{dependency}-manifest-digest"
-            value = assembly_labels.get(key)
-            if not isinstance(value, str) or not _LOWER_SHA256.fullmatch(value):
-                failures.append(
-                    f"learner {dependency} manifest label is invalid"
-                )
+        failures.append(f"{role} project image tag label is missing")
 
     output.update(
         {
             "ok": not failures,
             "image_id": image_id,
-            "repo_digests": repo_digests,
             "entrypoint": entrypoint,
             "cmd": command,
-            "identity_labels": identity_labels,
-            "assembly_labels": assembly_labels,
+            "runtime_labels": runtime_labels,
         }
     )
     if failures:
@@ -592,21 +501,6 @@ def doctor_images(
         inspected, image_failures = _inspect_image(role, reference, runner)
         images[role] = inspected
         failures.extend(image_failures)
-
-    stack_ids = {
-        image.get("identity_labels", {}).get("stack_source_id")
-        for image in images.values()
-        if image.get("identity_labels", {}).get("stack_source_id")
-    }
-    contract_digests = {
-        image.get("identity_labels", {}).get("contracts_artifact_digest")
-        for image in images.values()
-        if image.get("identity_labels", {}).get("contracts_artifact_digest")
-    }
-    if len(stack_ids) > 1:
-        failures.append("runtime images do not share one stack_source_id")
-    if len(contract_digests) > 1:
-        failures.append("runtime images do not share one Contracts artifact")
 
     return result(
         "images",

@@ -33,9 +33,37 @@ RL-Training-Framework/
   rl-framework/
 ```
 
-`make shell` is a host command. It prepares development images and artifacts for
-the current source automatically, then opens a source-mounted container. Run
-`./build.sh` or `./run.sh` only after entering that container.
+Each component's `make shell` is a host command. It builds an image and creates a
+development container when that container is absent; otherwise it starts the
+container only if needed and enters it directly. It neither synchronizes
+dependencies or protocols nor force-replaces a resident container after source,
+Dockerfile, or environment changes. Run `./build.sh` or `./run.sh` only after
+entering the container.
+
+A fresh workspace should first run one independent artifact script. It builds the
+task-neutral Training Contracts, Sample Pool, and Model Distributor formal
+artifacts, then copies only the two service artifacts required by Learner into
+their repository-owned locations:
+
+```bash
+cd RL-Training-Framework/rl-framework
+bash ./sync_artifacts.sh
+```
+
+This script never replaces Learner, AIServer, or Client Proto/schemas and does not
+start containers or a control plane. AIServer and Client each already own a
+compilable Maze Task Proto. Only when intentionally adopting the current Maze
+protocol release from Contracts should a developer run the separate command and
+review both consumer diffs:
+
+```bash
+bash ./sync_maze_protocol.sh
+```
+
+Each component still owns its `make shell`, `./build.sh`, and `./run.sh`
+lifecycle. After Dockerfile.dev, toolchain, port, environment, or mount changes,
+run that component's explicit `make dev-refresh`. It refreshes only the container
+environment and synchronizes neither protocols nor dependencies.
 
 ### 1.2 Start Learner
 
@@ -103,8 +131,9 @@ ACK, and activation of the new model.
 
 ## 2. Static model evaluation
 
-Static evaluation starts only AIServer and Client. Prepare a regular, non-symlink
-model file named exactly `SaveModel.onnx`.
+Static evaluation starts only AIServer and Client. Prepare a non-empty, regular,
+non-symlink ONNX model file. Its filename and parent-directory layout are not a
+cross-component contract.
 
 AIServer terminal:
 
@@ -117,7 +146,7 @@ make shell
 ./run.sh \
   --config configs/server_config.yaml \
   --workload evaluation \
-  --evaluation-model /absolute/path/SaveModel.onnx
+  --evaluation-model /absolute/path/model.onnx
 ```
 
 Client terminal:
@@ -132,9 +161,15 @@ make shell
 ```
 
 AIServer pins the selected model and does not connect to Sample Pool or Model
-Distributor or emit training samples. After Client completes the evaluation Episode
-assigned by AIServer, its business process exits while `run.sh` keeps the Replay HTTP
-service available until it receives a stop signal.
+Distributor or emit training samples. Client exits after completing the evaluation
+Episode assigned by AIServer. `run.sh` does not start Replay; start the independent,
+resident service from inside the Client development container when needed:
+
+```bash
+bash ./run_replay.sh
+```
+
+From the host, `make replay` starts the same service inside the container.
 
 ## 3. Stopping services and local pages
 
@@ -153,6 +188,15 @@ development container while it still owns a business process.
 - Monitor shows factual Sample, Train Update, model, and Episode metrics for the local
   run. Replay displays the environment sequence recorded by Client.
 
+Replay is independent of the Client business process. Stop it inside the Client
+development container with:
+
+```bash
+bash ./run_replay.sh -stop
+```
+
+From the host, use `make replay-stop`.
+
 ## 4. Read-only diagnostics
 
 `framework` only reads source, artifact, model, and image facts. It does not create or
@@ -164,14 +208,14 @@ cd RL-Training-Framework/rl-framework
 
 ./framework doctor source --json
 ./framework doctor artifacts --json
-./framework doctor model --model /path/SaveModel.onnx --json
+./framework doctor model --model /path/model.onnx --json
 ./framework doctor images \
   --learner-image <ref> \
   --aiserver-image <ref> \
   --client-image <ref> \
   --json
 ./framework doctor all \
-  --model /path/SaveModel.onnx \
+  --model /path/model.onnx \
   --learner-image <ref> \
   --aiserver-image <ref> \
   --client-image <ref> \
@@ -179,38 +223,78 @@ cd RL-Training-Framework/rl-framework
 ```
 
 - `source` reads branch, HEAD, and dirty state for the related source repositories.
-- `artifacts` verifies formal Contracts, Sample Pool, and Model Distributor manifests
-  and file digests.
-- `model` checks `SaveModel.onnx` file boundaries, size, and SHA-256.
-- `images` only inspects image identity, entrypoints, and default arguments.
+- `artifacts` verifies formal Contracts, Sample Pool, and Model Distributor manifests,
+  required files, and executable entrypoints.
+- `model` verifies that the selected model is a non-empty, regular, non-symlink file;
+  it does not constrain the filename or training-directory layout.
+- `images` only inspects each image's declared component, entrypoint, and default
+  arguments.
 - `all` aggregates the checks above.
 
 ## 5. Formal artifacts and runtime images
 
-Local `make shell` uses isolated development artifacts and does not require clean
-source. To build runtime images, first generate and synchronize formal artifacts from
-the workspace root in dependency order:
+Local `make shell` does not require clean source and performs no artifact
+synchronization. Before building or starting Learner in a fresh workspace, build
+and synchronize its required dependencies from Framework with one command:
 
 ```bash
-(cd rl-contracts && bash build_artifact.sh)
+cd RL-Training-Framework/rl-framework
+bash ./sync_artifacts.sh
+```
+
+It builds the `training` profile from `rl-contracts`, followed by
+`rl-sample-pool` and `rl-model-distributor`, and finally stages only each service's
+complete `bin/config/manifest` into Learner. Learner Proto/schemas and the
+AIServer/Client task protocol are not rewritten. The script downloads no
+repository, starts no container, and invokes no control plane. The equivalent
+manual flow is:
+
+```bash
+(cd rl-contracts && bash build_artifact.sh training)
 (cd rl-sample-pool && bash build_artifact.sh)
 (cd rl-model-distributor && bash build_artifact.sh)
 (cd rl-learner && bash scripts/sync_runtime_artifacts.sh)
-(cd rl-aiserver && bash scripts/sync_contract_snapshot.sh)
-(cd maze-client && bash scripts/sync_contract_snapshot.sh)
 ```
 
-After formal artifacts are synchronized and the corresponding source repositories are
-clean, build the three runtime images from the host:
+Artifacts supplied by another environment may instead be copied by hand. Copy the
+complete Sample Pool and Model Distributor `bin/`, `config/`, and `manifest.json`
+trees into Learner's `sample-pool/` and `model-distributor/`. Never copy a binary
+without its manifest/config or mix package versions or binary platforms; both
+manifests must declare the task-neutral Training Contracts version required by
+Learner. These binaries are the only extra inputs that must be staged before
+`make shell`; Learner-local Proto/schemas are not automatically replaced from
+Contracts.
+
+AIServer and Client `proto/` directories are repository-owned source. Normal
+`make shell`, builds, dependency synchronization, and `make dev-refresh` use them
+directly. To intentionally switch to the current Maze release in Contracts, run:
 
 ```bash
-(cd rl-learner && bash build_image.sh)
-(cd rl-aiserver && bash build_image.sh)
-(cd maze-client && bash build_image.sh)
+bash ./sync_maze_protocol.sh
 ```
 
-The build scripts verify source and artifact identity and print the resulting immutable
-image references.
+That command builds the `task-maze` profile and updates each consumer's Maze Task
+Proto, generated C++ bindings, and required task schemas according to its own
+inventory. It is not a normal build prerequisite. An uncompilable Proto or RPC
+wire mismatch is exposed by the real Client-AIServer build/communication path,
+not preemptively locked by central-artifact platform/source hashes or an automatic
+pull. After any deliberately required sync, run `make shell` in each component and
+compile/start inside the containers as described in section 1.
+
+After formal artifacts are synchronized, build the three runtime images separately
+from the host while using the same project tag:
+
+```bash
+(cd rl-learner && RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh)
+(cd rl-aiserver && RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh)
+(cd maze-client && RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh)
+```
+
+The commands produce `rl-training/learner:maze-tag-001`,
+`rl-training/aiserver:maze-tag-001`, and `rl-training/maze-client:maze-tag-001`.
+A later tuning build may overwrite the same tag. Building does not start containers;
+use the component development-container entrypoints in sections 1 and 2 for local
+training or evaluation.
 
 ## 6. Project description and architecture
 
@@ -239,9 +323,15 @@ Local training currently consists of three development containers:
 └─────────────────────────────────────────────────────┘
 ```
 
-The containers share one Contracts identity, while each component owns only its own
-configuration and runtime responsibilities. Configuration files provide complete
-defaults; explicit component command-line arguments can override supported fields.
+Client and AIServer communicate only through the Maze Task Proto they jointly adopt
+(`rl.task.maze/1`). AIServer and Learner-side components communicate through the
+task-neutral Training Proto, model manifest, and Training Contract fields. These
+contract surfaces can evolve independently: the three containers need not originate
+from one Contracts release, and source hashes, build hashes, and platform values do
+not bind them into one stack identity. Platform selects only the binary artifact
+actually staged into Learner. Each component owns its own configuration and runtime
+responsibilities. Configuration files provide complete defaults; supported explicit
+command-line arguments may override them.
 
 ### 6.2 Component responsibilities
 
@@ -249,7 +339,7 @@ defaults; explicit component command-line arguments can override supported field
 | --- | --- |
 | Maze Client | Load the map, maintain environment and Agent state, execute actions returned by AIServer, report terminal state, and generate Replay. |
 | AIServer | Manage Client sessions, perform ONNX inference and Reward calculation, pin one model per Agent segment, calculate GAE, and pass discrete transitions to SampleDistributor. |
-| SampleDistributor | AIServer's asynchronous producer: bounded local queue, batched envelopes, idempotent delivery, finite retries, recovery waiting, and shutdown drain. |
+| SampleDistributor | AIServer's asynchronous producer: bounded local queue, batched envelopes, finite retransmission of the same payload, and shutdown drain. |
 | Sample Pool | Learner-container sample backend: store processed transitions, evict the oldest READY transitions by FIFO under capacity pressure, and lease uniformly sampled transitions without replacement to Learner. |
 | Learner | Acquire training batches from Sample Pool, run PPO forward/backward and optimizer updates, commit sample outcomes, and publish new models. |
 | Model Distributor | Register atomically published Learner model packages and provide exact model download, identity checks, and ACK facts to AIServer. |
@@ -257,23 +347,27 @@ defaults; explicit component command-line arguments can override supported field
 
 ### 6.3 Training data flow
 
-1. Client creates Agents from the EnvironmentRuntimeSpec assigned by AIServer and
-   continuously returns environment state.
+1. Client creates Agents from the environment facts in AIServer
+   `OpenSessionRsp.environment` and continuously returns environment state.
+   Action masks are an optional task-contract mode: when disabled, no component
+   produces or consumes a mask; when enabled, Client reports only the current
+   environment availability fact and AIServer and Learner consume it along the same
+   sample path.
 2. AIServer uses the model pinned by each Agent for inference, returns actions, and
    accumulates action, reward, value, behavior log-probability, and environment result
    into that Agent's continuous segment.
 3. Each Agent segment contains at most `TMax=128` transitions. A terminal result, TMax,
    or controlled shutdown closes it. Terminal closure uses `bootstrap_value=0`; TMax
    and controlled closure compute bootstrap with the pinned model.
-4. AIServer calculates GAE over the continuous single-Agent segment, then splits it
-   into independent processed transitions. Only the final transition carries an
-   explicit segment close reason and bootstrap.
+4. AIServer calculates GAE over the continuous single-Agent segment, then projects it
+   into independent processed transitions. Segment close reason, bootstrap, and
+   continuity validation remain internal AIServer producer facts and do not enter
+   `ProcessedTransition`; Learner receives only PPO fields and real model provenance.
 5. SampleDistributor groups transitions into batched envelopes and sends them
    asynchronously to Sample Pool in the Learner container.
-6. Sample Pool draws READY transitions uniformly without replacement. By default,
-   Learner leases `4096` transitions per Train Update, runs `4` epochs with mini-batches
-   of at most `512` transitions, then ACKs and removes the batch after a successful
-   commit.
+6. Sample Pool draws READY transitions uniformly without replacement. Learner uses
+   the train-batch, mini-batch, and epoch settings in `configs/learner_config.yaml`,
+   then ACKs and removes the batch after a successful commit.
 7. After an update, Learner publishes a new `models/train/<model_step>/` package. Model
    Distributor exposes it; AIServer downloads, validates, prepares, and exactly ACKs
    it, then activates it only at each Agent's segment boundary.
@@ -290,17 +384,22 @@ to at least seven digits:
 models/train/
   0000000/
     SaveModel.onnx
-    manifest.json
-    metadata.json
+    manifest.pb
   0000001/
     SaveModel.onnx
-    manifest.json
-    metadata.json
+    manifest.pb
+  runtime/checkpoints/
+    publication-0000001.checkpoint.pt
 ```
 
 `0000000` is the bootstrap model created for the current Learner invocation. The first
-successful Train Update publishes `0000001`. Model identity, Train Update count, and
-public `model_step` remain aligned.
+successful Train Update publishes `0000001`. `manifest.pb` is the only authoritative
+public model manifest. `runtime/checkpoints` is private to the current invocation; it
+is not part of a model package and is not an automatic resume entrypoint. The names
+and directories above are Learner's current local publication layout. Model
+Distributor validates the regular file selected by registration plus the size and
+content digest declared by `manifest.pb`; it does not treat `SaveModel.onnx` or seven-digit directories as a
+cross-component contract.
 
 ## 7. Related repositories
 
