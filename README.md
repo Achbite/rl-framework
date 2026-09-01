@@ -33,8 +33,29 @@ RL-Training-Framework/
   rl-framework/
 ```
 
-`make shell` 是宿主机入口，会自动准备当前源码对应的开发镜像和开发制品，并进入源码挂载容器。
-进入容器后再执行 `./build.sh` 或 `./run.sh`。
+各组件的 `make shell` 都是宿主机入口：对应开发容器不存在时构建镜像并创建容器；容器存在时只在
+必要时启动，然后直接进入源码挂载容器。它不自动同步依赖或协议，也不因源码、Dockerfile 或
+环境变化强制替换常驻容器。进入容器后再执行 `./build.sh` 或 `./run.sh`。
+
+全新工作区先运行一次独立制品脚本。它生成 task-neutral Training Contracts、Sample Pool 与
+Model Distributor 正式制品，并只把 Learner 必需的两个服务制品复制到其仓库约定位置：
+
+```bash
+cd RL-Training-Framework/rl-framework
+bash ./sync_artifacts.sh
+```
+
+该脚本不覆盖 Learner、AIServer 或 Client 的 Proto/schema，不启动容器或控制面。AIServer 与
+Client 已各自持有可编译的 Maze Task Proto；只有开发者明确决定采用 Contracts 仓当前 Maze 协议
+release 时才执行以下独立命令，并审查两个消费仓的 diff：
+
+```bash
+bash ./sync_maze_protocol.sh
+```
+
+同步完成后仍由各组件自己的 `make shell`、`./build.sh` 和 `./run.sh` 负责开发容器与业务进程。
+Dockerfile.dev、工具链、端口、环境变量或挂载发生变化时，显式执行组件仓的 `make dev-refresh`；
+该命令只刷新容器环境，也不会同步协议或依赖。
 
 ### 1.2 启动 Learner
 
@@ -97,8 +118,8 @@ Learner → AIServer → Client
 
 ## 2. 静态模型评测
 
-静态评测只启动 AIServer 和 Client。准备一个常规、非符号链接且文件名精确为
-`SaveModel.onnx` 的模型文件。
+静态评测只启动 AIServer 和 Client。准备一个非空、常规且非符号链接的 ONNX 模型文件；文件名和
+上层目录不是跨组件合同。
 
 AIServer 终端：
 
@@ -111,7 +132,7 @@ make shell
 ./run.sh \
   --config configs/server_config.yaml \
   --workload evaluation \
-  --evaluation-model /absolute/path/SaveModel.onnx
+  --evaluation-model /absolute/path/model.onnx
 ```
 
 Client 终端：
@@ -126,8 +147,14 @@ make shell
 ```
 
 AIServer 会固定加载指定模型，不连接 Sample Pool 或 Model Distributor，也不发送训练样本。Client
-完成 AIServer 下发的一次 evaluation Episode 后退出业务进程，`run.sh` 会继续保留 Replay HTTP
-服务，直到收到停止信号。
+完成 AIServer 下发的一次 evaluation Episode 后退出业务进程。`run.sh` 不启动 Replay；需要查看回放时，
+在 Client 开发容器内单独启动常驻服务：
+
+```bash
+bash ./run_replay.sh
+```
+
+从宿主机使用 `make replay` 启动同一容器内服务。
 
 ## 3. 停止服务与本地页面
 
@@ -145,6 +172,14 @@ Client → AIServer → Learner
 - Monitor 展示本次本地训练的真实 Sample、Train Update、模型和 Episode 指标；Replay 用于查看 Client
   记录的环境过程。
 
+Replay 与 Client 业务进程相互独立；停止 Replay 时在 Client 开发容器中执行：
+
+```bash
+bash ./run_replay.sh -stop
+```
+
+从宿主机使用 `make replay-stop`。
+
 ## 4. 只读诊断
 
 `framework` 只读取源码、制品、模型和镜像事实，不创建或启停容器，也不生成运行 spec、lock 或
@@ -155,14 +190,14 @@ cd RL-Training-Framework/rl-framework
 
 ./framework doctor source --json
 ./framework doctor artifacts --json
-./framework doctor model --model /path/SaveModel.onnx --json
+./framework doctor model --model /path/model.onnx --json
 ./framework doctor images \
   --learner-image <ref> \
   --aiserver-image <ref> \
   --client-image <ref> \
   --json
 ./framework doctor all \
-  --model /path/SaveModel.onnx \
+  --model /path/model.onnx \
   --learner-image <ref> \
   --aiserver-image <ref> \
   --client-image <ref> \
@@ -170,34 +205,62 @@ cd RL-Training-Framework/rl-framework
 ```
 
 - `source`：读取关联源码仓库的 branch、HEAD 和 dirty 状态。
-- `artifacts`：校验 Contracts、Sample Pool 和 Model Distributor 的正式 manifest 与文件 digest。
-- `model`：检查 `SaveModel.onnx` 的文件边界、大小和 SHA-256。
-- `images`：只执行 image inspect，核对镜像身份、入口和默认参数。
+- `artifacts`：校验 Contracts、Sample Pool 和 Model Distributor 的正式 manifest、必需文件和可执行入口。
+- `model`：检查所选模型是非空、常规且非符号链接的文件，不约束文件名或训练目录布局。
+- `images`：只执行 image inspect，核对各镜像自身声明的组件、入口和默认参数。
 - `all`：聚合以上检查。
 
 ## 5. 正式制品与运行镜像
 
-本地 `make shell` 使用独立的开发制品，不要求源码 clean。构建正式运行镜像时，先在工作区根目录
-按依赖顺序生成并同步正式制品：
+本地 `make shell` 不要求源码 clean，也不执行制品同步。全新工作区构建或启动 Learner 前，可从
+Framework 仓一次完成其必需依赖的顺序构建与同步：
 
 ```bash
-(cd rl-contracts && bash build_artifact.sh)
+cd RL-Training-Framework/rl-framework
+bash ./sync_artifacts.sh
+```
+
+它会构建 `rl-contracts` 的 `training` profile，再依次构建 `rl-sample-pool` 与
+`rl-model-distributor`，最后只把两个服务各自完整的 `bin/config/manifest` 同步到 Learner。
+Learner 的 Proto/schema、AIServer/Client 的任务协议均不会被改写。脚本不下载仓库、不启动容器，
+也不调用控制面。以下命令是完全等价的手动流程：
+
+```bash
+(cd rl-contracts && bash build_artifact.sh training)
 (cd rl-sample-pool && bash build_artifact.sh)
 (cd rl-model-distributor && bash build_artifact.sh)
 (cd rl-learner && bash scripts/sync_runtime_artifacts.sh)
-(cd rl-aiserver && bash scripts/sync_contract_snapshot.sh)
-(cd maze-client && bash scripts/sync_contract_snapshot.sh)
 ```
 
-正式制品同步完成且对应源码仓库 clean 后，在宿主机分别构建三个运行镜像：
+已经由其他环境提供制品时，也可以手工把 Sample Pool 和 Model Distributor 各自完整的
+`bin/`、`config/`、`manifest.json` 复制到 Learner 的 `sample-pool/` 与 `model-distributor/`。
+不能只复制二进制而丢失其 manifest/config，也不能混用不同包版本或不同二进制平台；两个 manifest
+必须声明 Learner 当前要求的 task-neutral Training Contracts 版本。这些二进制是 `make shell` 前
+唯一必须额外装配的内容，Learner 自己的 Proto/schema 不从 Contracts 自动覆盖。
+
+AIServer 与 Client 的 `proto/` 属于各自源码，正常 `make shell`、构建、依赖同步和
+`make dev-refresh` 都直接使用它们。若开发者主动切换到 Contracts 仓当前 Maze release，独立执行：
 
 ```bash
-(cd rl-learner && bash build_image.sh)
-(cd rl-aiserver && bash build_image.sh)
-(cd maze-client && bash build_image.sh)
+bash ./sync_maze_protocol.sh
 ```
 
-构建脚本会校验源码与制品身份，并打印生成的不可复用镜像引用。
+该命令构建 `task-maze` profile，再按两个消费仓各自清单更新 Maze Task Proto、生成 C++ bindings
+及所需任务 schema；它不是正常构建前置步骤。Proto 不可编译或 RPC wire 不一致会由真实
+Client↔AIServer 编译/通信失败暴露，不再用中央 artifact 的平台、源码哈希或自动回拉行为提前锁死。
+完成所需的显式同步后，即可进入三个组件仓分别执行 `make shell`，再在容器内按第 1 节编译和启动。
+
+正式制品同步完成后，在宿主机使用同一个项目 tag 分别构建三个运行镜像：
+
+```bash
+(cd rl-learner && RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh)
+(cd rl-aiserver && RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh)
+(cd maze-client && RL_PROJECT_IMAGE_TAG=maze-tag-001 bash build_image.sh)
+```
+
+三个命令分别生成 `rl-training/learner:maze-tag-001`、
+`rl-training/aiserver:maze-tag-001` 与 `rl-training/maze-client:maze-tag-001`。同名 tag 允许由后续微调
+构建直接覆盖；构建本身不会启动容器。需要本地训练或评测时，继续使用第 1、2 节的组件开发容器入口。
 
 ## 6. 项目说明与架构
 
@@ -226,8 +289,11 @@ cd RL-Training-Framework/rl-framework
 └─────────────────────────────────────────────────────┘
 ```
 
-三个容器共享一套 Contracts 身份，但各自只拥有本组件的配置和运行职责。配置文件提供完整默认值；
-组件支持的显式命令参数可以覆盖对应配置项。
+Client 与 AIServer 只按其共同采用的 Maze Task Proto（`rl.task.maze/1`）通信；AIServer 与 Learner
+侧组件按 task-neutral Training Proto、模型 manifest 和 Training Contract 字段通信。两个合同面可以
+独立演进，不要求三个容器来自同一个 Contracts release，也不通过源码哈希、构建哈希或平台值绑定
+为一个整体。平台只用于选择实际装入 Learner 的二进制制品。各组件只拥有本组件的配置和运行职责；
+配置文件提供完整默认值，组件支持的显式命令参数可以覆盖对应配置项。
 
 ### 6.2 组件职责
 
@@ -235,7 +301,7 @@ cd RL-Training-Framework/rl-framework
 | --- | --- |
 | Maze Client | 加载地图、维护环境与 Agent 状态、执行 AIServer 下发的动作、报告终局状态并生成 Replay。 |
 | AIServer | 管理 Client session，执行 ONNX 推理与 Reward 计算；为每个 Agent 固定一个 segment 使用的模型，计算 GAE，并将离散 transition 交给 SampleDistributor。 |
-| SampleDistributor | AIServer 内的异步生产端；负责有界本地队列、批量 envelope、幂等发送、有限重试、恢复等待和停止排空。 |
+| SampleDistributor | AIServer 内的异步生产端；负责有界本地队列、批量 envelope、同一 payload 的有限重发和停止排空。 |
 | Sample Pool | Learner 容器内的样本后端；保存 processed transition，容量压力下按 FIFO 淘汰最老 READY 样本，并向 Learner 随机无放回交付租约批次。 |
 | Learner | 从 Sample Pool 取得训练批次，执行 PPO forward/backward 与 optimizer update，提交样本处理结果并发布新模型。 |
 | Model Distributor | 注册 Learner 原子发布的模型包，向 AIServer 提供精确模型下载、身份校验和 ACK 事实。 |
@@ -243,17 +309,20 @@ cd RL-Training-Framework/rl-framework
 
 ### 6.3 训练数据链
 
-1. Client 根据 AIServer 下发的 EnvironmentRuntimeSpec 创建 Agent，并持续回传环境状态。
+1. Client 根据 AIServer `OpenSessionRsp.environment` 下发的环境事实创建 Agent，并持续回传环境状态。
+   action mask 是任务合同中的可选模式：关闭时不生成或消费遮罩；开启时 Client 只回传当前环境的
+   可用动作事实，AIServer 与 Learner 沿同一条样本链消费它。
 2. AIServer 使用当前 Agent 所固定的模型执行推理，返回动作，并把 action、reward、value、
    behavior log-prob 和环境结果累计到该 Agent 的连续 segment。
 3. 每个 Agent 的 segment 最多累计 `TMax=128` 个 transition；terminal、TMax 或受控关闭都会封口。
    terminal 边界使用 `bootstrap_value=0`，TMax 和受控关闭使用 pinned model 计算 bootstrap。
-4. AIServer 在同一 Agent 的连续 segment 上计算 GAE，再把 segment 离散为独立 processed
-   transition；只有最后一个 transition 携带明确的 segment close reason 和 bootstrap。
+4. AIServer 在同一 Agent 的连续 segment 上计算 GAE，再把 segment 投影为独立 processed
+   transition。segment close reason、bootstrap 和连续性校验是 AIServer 内部 producer 事实，不进入
+   `ProcessedTransition`；Learner 只接收 PPO 所需字段及真实模型 provenance。
 5. SampleDistributor 将 transition 组成批量 envelope，异步发送到 Learner 容器内的 Sample Pool。
-6. Sample Pool 对 READY transition 进行随机无放回抽取。默认 Learner 每次 Train Update 租用
-   `4096` 个 transition，以最大 `512` 个 transition 的 mini-batch 运行 `4` 个 epoch；成功提交后
-   ACK 并移除本批样本。
+6. Sample Pool 对 READY transition 进行随机无放回抽取。Learner 按
+   `configs/learner_config.yaml` 的 train batch、mini-batch 与 epoch 配置执行 PPO；成功提交后 ACK
+   并移除本批样本。
 7. Learner 完成一次更新后发布新的 `models/train/<model_step>/` 模型包。Model Distributor 暴露
    已发布模型，AIServer 下载、校验、Prepare 并精确 ACK，只在各 Agent 的 segment 边界激活新模型。
 8. Client、AIServer、Sample Pool、Learner 和模型分发链产生的事实进入本地 Monitor，展示真实的
@@ -267,16 +336,19 @@ Learner 公开的训练模型按 `model_step` 归档，目录名至少七位左�
 models/train/
   0000000/
     SaveModel.onnx
-    manifest.json
-    metadata.json
+    manifest.pb
   0000001/
     SaveModel.onnx
-    manifest.json
-    metadata.json
+    manifest.pb
+  runtime/checkpoints/
+    publication-0000001.checkpoint.pt
 ```
 
 `0000000` 是本次 Learner 启动生成的 bootstrap 模型；第一次成功的 Train Update 发布
-`0000001`。模型身份、训练更新计数和公开 `model_step` 保持一致。
+`0000001`。`manifest.pb` 是公开模型包的唯一权威清单；`runtime/checkpoints` 是本次训练的私有
+checkpoint，不属于模型包，也不是后续训练的自动恢复入口。上述文件名和目录是 Learner 当前的
+本地发布布局；Model Distributor 按注册请求选择的常规文件、manifest 声明的大小和内容 digest 校验模型字节，
+不把 `SaveModel.onnx` 或七位目录名解释为跨组件合同。
 
 ## 7. 关联仓库
 
