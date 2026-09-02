@@ -5,7 +5,7 @@ set -euo pipefail
 framework_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 workspace_root="$(cd "${framework_root}/.." && pwd -P)"
 
-echo "[artifacts] building task-neutral training contracts"
+echo "[artifacts] building task-neutral training protocol bindings"
 RL_TRAINING_WORKSPACE="${workspace_root}" \
   bash "${workspace_root}/rl-contracts/build_artifact.sh" training
 

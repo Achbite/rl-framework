@@ -37,7 +37,7 @@ RL-Training-Framework/
 必要时启动，然后直接进入源码挂载容器。它不自动同步依赖或协议，也不因源码、Dockerfile 或
 环境变化强制替换常驻容器。进入容器后再执行 `./build.sh` 或 `./run.sh`。
 
-全新工作区先运行一次独立制品脚本。它生成 task-neutral Training Contracts、Sample Pool 与
+全新工作区先运行一次独立制品脚本。它生成 task-neutral Training Proto 编译输入、Sample Pool 与
 Model Distributor 正式制品，并只把 Learner 必需的两个服务制品复制到其仓库约定位置：
 
 ```bash
@@ -45,13 +45,22 @@ cd RL-Training-Framework/rl-framework
 bash ./sync_artifacts.sh
 ```
 
-该脚本不覆盖 Learner、AIServer 或 Client 的 Proto/schema，不启动容器或控制面。AIServer 与
+该脚本不覆盖 Learner、AIServer 或 Client 的 Proto，不启动容器或控制面。AIServer 与
 Client 已各自持有可编译的 Maze Task Proto；只有开发者明确决定采用 Contracts 仓当前 Maze 协议
 release 时才执行以下独立命令，并审查两个消费仓的 diff：
 
 ```bash
 bash ./sync_maze_protocol.sh
 ```
+
+task-neutral Training Proto 也按相同原则由消费仓持有；只有明确采用 Contracts 仓当前训练协议时才执行：
+
+```bash
+bash ./sync_training_protocol.sh
+```
+
+该命令只更新 AIServer 与 Learner 的训练协议输入。协议变化后再运行 `sync_artifacts.sh`，即可让
+Sample Pool 与 Model Distributor 使用同一份当前 Training Proto 重新编译。
 
 同步完成后仍由各组件自己的 `make shell`、`./build.sh` 和 `./run.sh` 负责开发容器与业务进程。
 Dockerfile.dev、工具链、端口、环境变量或挂载发生变化时，显式执行组件仓的 `make dev-refresh`；
@@ -205,7 +214,8 @@ cd RL-Training-Framework/rl-framework
 ```
 
 - `source`：读取关联源码仓库的 branch、HEAD 和 dirty 状态。
-- `artifacts`：校验 Contracts、Sample Pool 和 Model Distributor 的正式 manifest、必需文件和可执行入口。
+- `artifacts`：直接检查 Learner 装配目录中的 Sample Pool、Model Distributor 二进制与配置是否存在，
+  并确认两个二进制可执行；不比较 manifest、包版本、平台、源码或内容哈希。
 - `model`：检查所选模型是非空、常规且非符号链接的文件，不约束文件名或训练目录布局。
 - `images`：只执行 image inspect，核对各镜像自身声明的组件、入口和默认参数。
 - `all`：聚合以上检查。
@@ -220,9 +230,10 @@ cd RL-Training-Framework/rl-framework
 bash ./sync_artifacts.sh
 ```
 
-它会构建 `rl-contracts` 的 `training` profile，再依次构建 `rl-sample-pool` 与
-`rl-model-distributor`，最后只把两个服务各自完整的 `bin/config/manifest` 同步到 Learner。
-Learner 的 Proto/schema、AIServer/Client 的任务协议均不会被改写。脚本不下载仓库、不启动容器，
+它会构建 `rl-contracts` 的 `training` profile，作为 Sample Pool 与 Model Distributor 本次编译的
+Proto 输入，再依次构建这两个服务，最后只把它们的二进制与配置同步到 Learner。同步始终更新二进制；
+目标配置不存在时才复制默认配置，已存在的本地配置不会被覆盖。
+Learner 的 Proto、AIServer/Client 的任务协议均不会被改写。脚本不下载仓库、不启动容器，
 也不调用控制面。以下命令是完全等价的手动流程：
 
 ```bash
@@ -232,11 +243,12 @@ Learner 的 Proto/schema、AIServer/Client 的任务协议均不会被改写。�
 (cd rl-learner && bash scripts/sync_runtime_artifacts.sh)
 ```
 
-已经由其他环境提供制品时，也可以手工把 Sample Pool 和 Model Distributor 各自完整的
-`bin/`、`config/`、`manifest.json` 复制到 Learner 的 `sample-pool/` 与 `model-distributor/`。
-不能只复制二进制而丢失其 manifest/config，也不能混用不同包版本或不同二进制平台；两个 manifest
-必须声明 Learner 当前要求的 task-neutral Training Contracts 版本。这些二进制是 `make shell` 前
-唯一必须额外装配的内容，Learner 自己的 Proto/schema 不从 Contracts 自动覆盖。
+已经由其他环境提供制品时，也可以手工完成同一装配：将 `maze_sample_pool` 放到
+`rl-learner/sample-pool/bin/`，将 `maze_model_distributor` 放到
+`rl-learner/model-distributor/bin/`，并赋予可执行权限；仅在对应目标配置不存在时，分别复制
+`pool_config.yaml` 与 `model_distributor_config.yaml` 到两个 `config/` 目录。运行链不读取额外
+manifest，也不按仓库版本、平台字符串或哈希拒绝这些组件。Learner 自己的 Proto 不从 Contracts
+自动覆盖。
 
 AIServer 与 Client 的 `proto/` 属于各自源码，正常 `make shell`、构建、依赖同步和
 `make dev-refresh` 都直接使用它们。若开发者主动切换到 Contracts 仓当前 Maze release，独立执行：
@@ -245,10 +257,14 @@ AIServer 与 Client 的 `proto/` 属于各自源码，正常 `make shell`、构�
 bash ./sync_maze_protocol.sh
 ```
 
-该命令构建 `task-maze` profile，再按两个消费仓各自清单更新 Maze Task Proto、生成 C++ bindings
-及所需任务 schema；它不是正常构建前置步骤。Proto 不可编译或 RPC wire 不一致会由真实
+该命令构建 `task-maze` profile，再按两个消费仓各自清单更新 Maze Task Proto 与生成的 C++
+bindings；它不是正常构建前置步骤。Proto 不可编译或 RPC wire 不一致会由真实
 Client↔AIServer 编译/通信失败暴露，不再用中央 artifact 的平台、源码哈希或自动回拉行为提前锁死。
 完成所需的显式同步后，即可进入三个组件仓分别执行 `make shell`，再在容器内按第 1 节编译和启动。
+
+AIServer 与 Learner 的 task-neutral Training Proto 同样不自动同步。主动采用 Contracts 仓当前版本时，
+执行 `bash ./sync_training_protocol.sh`；随后执行 `bash ./sync_artifacts.sh` 重新编译并装配 Sample Pool
+与 Model Distributor。两个脚本分别处理源码协议采用和运行二进制装配，不以版本或哈希做运行准入。
 
 正式制品同步完成后，在宿主机使用同一个项目 tag 分别构建三个运行镜像：
 
@@ -289,23 +305,23 @@ Client↔AIServer 编译/通信失败暴露，不再用中央 artifact 的平台
 └─────────────────────────────────────────────────────┘
 ```
 
-Client 与 AIServer 只按其共同采用的 Maze Task Proto（`rl.task.maze/1`）通信；AIServer 与 Learner
-侧组件按 task-neutral Training Proto、模型 manifest 和 Training Contract 字段通信。两个合同面可以
-独立演进，不要求三个容器来自同一个 Contracts release，也不通过源码哈希、构建哈希或平台值绑定
-为一个整体。平台只用于选择实际装入 Learner 的二进制制品。各组件只拥有本组件的配置和运行职责；
+Client 与 AIServer 只按双方源码中共同采用的 Maze Task Proto 通信；AIServer、Sample Pool、Learner
+与 Model Distributor 按 task-neutral Training Proto 传输样本、模型元数据和生命周期结果。两个协议面
+可以独立演进，不要求三个容器来自同一个 Contracts release，也不通过协议 ID、仓库版本、源码哈希、
+构建哈希或平台值绑定为一个整体。各组件只拥有本组件的配置和运行职责；
 配置文件提供完整默认值，组件支持的显式命令参数可以覆盖对应配置项。
 
 ### 6.2 组件职责
 
-| 组件 | 当前职责 |
-| --- | --- |
-| Maze Client | 加载地图、维护环境与 Agent 状态、执行 AIServer 下发的动作、报告终局状态并生成 Replay。 |
-| AIServer | 管理 Client session，执行 ONNX 推理与 Reward 计算；为每个 Agent 固定一个 segment 使用的模型，计算 GAE，并将离散 transition 交给 SampleDistributor。 |
-| SampleDistributor | AIServer 内的异步生产端；负责有界本地队列、批量 envelope、同一 payload 的有限重发和停止排空。 |
-| Sample Pool | Learner 容器内的样本后端；保存 processed transition，容量压力下按 FIFO 淘汰最老 READY 样本，并向 Learner 随机无放回交付租约批次。 |
-| Learner | 从 Sample Pool 取得训练批次，执行 PPO forward/backward 与 optimizer update，提交样本处理结果并发布新模型。 |
-| Model Distributor | 注册 Learner 原子发布的模型包，向 AIServer 提供精确模型下载、身份校验和 ACK 事实。 |
-| Framework | 提供整个项目的使用说明、仓库导航和只读 doctor，不参与训练运行编排。 |
+| 组件              | 当前职责                                                                                                                                            |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Maze Client       | 加载地图、维护环境与 Agent 状态、执行 AIServer 下发的动作、报告终局状态并生成 Replay。                                                              |
+| AIServer          | 管理 Client session，执行 ONNX 推理与 Reward 计算；为每个 Agent 固定一个 segment 使用的模型，计算 GAE，并将离散 transition 交给 SampleDistributor。 |
+| SampleDistributor | AIServer 内的异步生产端；负责有界本地队列、批量 envelope、同一 payload 的有限重发和停止排空。                                                       |
+| Sample Pool       | Learner 容器内的样本后端；保存 processed transition，容量压力下按 FIFO 淘汰最老 READY 样本，并向 Learner 随机无放回交付租约批次。                   |
+| Learner           | 从 Sample Pool 取得训练批次，执行 PPO forward/backward 与 optimizer update，提交样本处理结果并发布新模型。                                          |
+| Model Distributor | 注册 Learner 原子发布的模型包，按 lineage/step 提供精确模型下载，并记录 AIServer 的加载 ACK 事实。                                                  |
+| Framework         | 提供整个项目的使用说明、仓库导航和只读 doctor，不参与训练运行编排。                                                                                 |
 
 ### 6.3 训练数据链
 
@@ -345,22 +361,23 @@ models/train/
 ```
 
 `0000000` 是本次 Learner 启动生成的 bootstrap 模型；第一次成功的 Train Update 发布
-`0000001`。`manifest.pb` 是公开模型包的唯一权威清单；`runtime/checkpoints` 是本次训练的私有
+`0000001`。`manifest.pb` 是公开模型包的元数据；`runtime/checkpoints` 是本次训练的私有
 checkpoint，不属于模型包，也不是后续训练的自动恢复入口。上述文件名和目录是 Learner 当前的
-本地发布布局；Model Distributor 按注册请求选择的常规文件、manifest 声明的大小和内容 digest 校验模型字节，
-不把 `SaveModel.onnx` 或七位目录名解释为跨组件合同。
+本地发布布局；Model Distributor 检查注册请求中的 lineage/step、常规模型文件和声明大小，下载时
+保持连续 offset，并记录加载 ACK；它不计算内容哈希，也不把 `SaveModel.onnx` 或七位目录名解释为
+跨组件合同。
 
 ## 7. 关联仓库
 
-| 仓库 | Git 地址 | 职责 |
-| --- | --- | --- |
-| rl-framework | [github.com/Achbite/rl-framework](https://github.com/Achbite/rl-framework) | 项目综合说明与只读诊断。 |
-| rl-contracts | [github.com/Achbite/rl-contracts](https://github.com/Achbite/rl-contracts) | 跨语言 Proto、Schema 与契约制品。 |
-| rl-sample-pool | [github.com/Achbite/rl-sample-pool](https://github.com/Achbite/rl-sample-pool) | Sample Pool 服务与样本存储。 |
-| rl-model-distributor | [github.com/Achbite/rl-model-distributor](https://github.com/Achbite/rl-model-distributor) | 模型注册、下载与 ACK 服务。 |
-| rl-learner | [github.com/Achbite/rl-learner](https://github.com/Achbite/rl-learner) | PPO Learner、模型发布与本地 Monitor。 |
-| rl-aiserver | [github.com/Achbite/rl-aiserver](https://github.com/Achbite/rl-aiserver) | 模型推理、Agent segment、GAE 与样本发送。 |
-| maze-client | [github.com/Achbite/maze-client](https://github.com/Achbite/maze-client) | 迷宫环境执行与 Replay。 |
+| 仓库                 | Git 地址                                                                                  | 职责                                      |
+| -------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------------- |
+| rl-framework         | [github.com/Achbite/rl-framework](https://github.com/Achbite/rl-framework)                 | 项目综合说明与只读诊断。                  |
+| rl-contracts         | [github.com/Achbite/rl-contracts](https://github.com/Achbite/rl-contracts)                 | 跨语言 Proto 源码与生成制品。             |
+| rl-sample-pool       | [github.com/Achbite/rl-sample-pool](https://github.com/Achbite/rl-sample-pool)             | Sample Pool 服务与样本存储。              |
+| rl-model-distributor | [github.com/Achbite/rl-model-distributor](https://github.com/Achbite/rl-model-distributor) | 模型注册、下载与 ACK 服务。               |
+| rl-learner           | [github.com/Achbite/rl-learner](https://github.com/Achbite/rl-learner)                     | PPO Learner、模型发布与本地 Monitor。     |
+| rl-aiserver          | [github.com/Achbite/rl-aiserver](https://github.com/Achbite/rl-aiserver)                   | 模型推理、Agent segment、GAE 与样本发送。 |
+| maze-client          | [github.com/Achbite/maze-client](https://github.com/Achbite/maze-client)                   | 迷宫环境执行与 Replay。                   |
 
 ## License
 
