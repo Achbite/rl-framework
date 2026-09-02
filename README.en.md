@@ -41,7 +41,7 @@ Dockerfile, or environment changes. Run `./build.sh` or `./run.sh` only after
 entering the container.
 
 A fresh workspace should first run one independent artifact script. It builds the
-task-neutral Training Contracts, Sample Pool, and Model Distributor formal
+task-neutral Training Proto inputs, Sample Pool, and Model Distributor
 artifacts, then copies only the two service artifacts required by Learner into
 their repository-owned locations:
 
@@ -50,7 +50,7 @@ cd RL-Training-Framework/rl-framework
 bash ./sync_artifacts.sh
 ```
 
-This script never replaces Learner, AIServer, or Client Proto/schemas and does not
+This script never replaces Learner, AIServer, or Client Proto and does not
 start containers or a control plane. AIServer and Client each already own a
 compilable Maze Task Proto. Only when intentionally adopting the current Maze
 protocol release from Contracts should a developer run the separate command and
@@ -59,6 +59,17 @@ review both consumer diffs:
 ```bash
 bash ./sync_maze_protocol.sh
 ```
+
+The task-neutral Training Proto follows the same repository-owned rule. Only when
+intentionally adopting the current training protocol from Contracts, run:
+
+```bash
+bash ./sync_training_protocol.sh
+```
+
+That command updates only the AIServer and Learner training-protocol inputs. After a
+protocol change, run `sync_artifacts.sh` again so Sample Pool and Model Distributor
+are rebuilt from the same current Training Proto.
 
 Each component still owns its `make shell`, `./build.sh`, and `./run.sh`
 lifecycle. After Dockerfile.dev, toolchain, port, environment, or mount changes,
@@ -223,8 +234,9 @@ cd RL-Training-Framework/rl-framework
 ```
 
 - `source` reads branch, HEAD, and dirty state for the related source repositories.
-- `artifacts` verifies formal Contracts, Sample Pool, and Model Distributor manifests,
-  required files, and executable entrypoints.
+- `artifacts` directly checks the Sample Pool and Model Distributor binaries and
+  configs staged in Learner, including executable permission on both binaries. It
+  compares no manifest, package version, platform, source hash, or content hash.
 - `model` verifies that the selected model is a non-empty, regular, non-symlink file;
   it does not constrain the filename or training-directory layout.
 - `images` only inspects each image's declared component, entrypoint, and default
@@ -242,9 +254,11 @@ cd RL-Training-Framework/rl-framework
 bash ./sync_artifacts.sh
 ```
 
-It builds the `training` profile from `rl-contracts`, followed by
-`rl-sample-pool` and `rl-model-distributor`, and finally stages only each service's
-complete `bin/config/manifest` into Learner. Learner Proto/schemas and the
+It builds the `training` profile from `rl-contracts` as the Proto input for the
+current Sample Pool and Model Distributor builds, then builds both services and
+stages only their binaries and configs into Learner. The binaries are always
+updated. A default config is copied only when the target config is absent, so an
+existing local config is preserved. Learner Proto and the
 AIServer/Client task protocol are not rewritten. The script downloads no
 repository, starts no container, and invokes no control plane. The equivalent
 manual flow is:
@@ -256,14 +270,14 @@ manual flow is:
 (cd rl-learner && bash scripts/sync_runtime_artifacts.sh)
 ```
 
-Artifacts supplied by another environment may instead be copied by hand. Copy the
-complete Sample Pool and Model Distributor `bin/`, `config/`, and `manifest.json`
-trees into Learner's `sample-pool/` and `model-distributor/`. Never copy a binary
-without its manifest/config or mix package versions or binary platforms; both
-manifests must declare the task-neutral Training Contracts version required by
-Learner. These binaries are the only extra inputs that must be staged before
-`make shell`; Learner-local Proto/schemas are not automatically replaced from
-Contracts.
+Artifacts supplied by another environment may instead be staged by hand. Put
+`maze_sample_pool` in `rl-learner/sample-pool/bin/` and
+`maze_model_distributor` in `rl-learner/model-distributor/bin/`, and mark both
+executable. Only when the corresponding target config is absent, copy
+`pool_config.yaml` and `model_distributor_config.yaml` into the two `config/`
+directories. The runtime reads no additional artifact manifest and rejects neither
+component by repository version, platform string, or hash. Learner-local Proto is
+not automatically replaced from Contracts.
 
 AIServer and Client `proto/` directories are repository-owned source. Normal
 `make shell`, builds, dependency synchronization, and `make dev-refresh` use them
@@ -274,12 +288,19 @@ bash ./sync_maze_protocol.sh
 ```
 
 That command builds the `task-maze` profile and updates each consumer's Maze Task
-Proto, generated C++ bindings, and required task schemas according to its own
+Proto and generated C++ bindings according to its own
 inventory. It is not a normal build prerequisite. An uncompilable Proto or RPC
 wire mismatch is exposed by the real Client-AIServer build/communication path,
 not preemptively locked by central-artifact platform/source hashes or an automatic
 pull. After any deliberately required sync, run `make shell` in each component and
 compile/start inside the containers as described in section 1.
+
+AIServer and Learner also keep their task-neutral Training Proto as repository-owned
+source. To deliberately adopt the current Contracts copy, run
+`bash ./sync_training_protocol.sh`, followed by `bash ./sync_artifacts.sh` to rebuild
+and stage Sample Pool and Model Distributor. One script adopts source protocol files;
+the other assembles runtime binaries. Neither makes a version or hash a runtime
+admission condition.
 
 After formal artifacts are synchronized, build the three runtime images separately
 from the host while using the same project tag:
@@ -323,13 +344,13 @@ Local training currently consists of three development containers:
 └─────────────────────────────────────────────────────┘
 ```
 
-Client and AIServer communicate only through the Maze Task Proto they jointly adopt
-(`rl.task.maze/1`). AIServer and Learner-side components communicate through the
-task-neutral Training Proto, model manifest, and Training Contract fields. These
-contract surfaces can evolve independently: the three containers need not originate
-from one Contracts release, and source hashes, build hashes, and platform values do
-not bind them into one stack identity. Platform selects only the binary artifact
-actually staged into Learner. Each component owns its own configuration and runtime
+Client and AIServer communicate only through the Maze Task Proto present in both
+source trees. AIServer, Sample Pool, Learner, and Model Distributor exchange samples,
+model metadata, and lifecycle results through the task-neutral Training Proto. The
+two protocol surfaces can evolve independently: the three containers need not
+originate from one Contracts release, and no protocol ID, repository version, source
+hash, build hash, or platform value binds them into one stack identity. Each
+component owns its own configuration and runtime
 responsibilities. Configuration files provide complete defaults; supported explicit
 command-line arguments may override them.
 
@@ -342,7 +363,7 @@ command-line arguments may override them.
 | SampleDistributor | AIServer's asynchronous producer: bounded local queue, batched envelopes, finite retransmission of the same payload, and shutdown drain. |
 | Sample Pool | Learner-container sample backend: store processed transitions, evict the oldest READY transitions by FIFO under capacity pressure, and lease uniformly sampled transitions without replacement to Learner. |
 | Learner | Acquire training batches from Sample Pool, run PPO forward/backward and optimizer updates, commit sample outcomes, and publish new models. |
-| Model Distributor | Register atomically published Learner model packages and provide exact model download, identity checks, and ACK facts to AIServer. |
+| Model Distributor | Register atomically published Learner model packages, provide exact downloads by lineage/step, and record AIServer load ACK facts. |
 | Framework | Provide consolidated usage, repository navigation, and read-only doctor commands without participating in runtime orchestration. |
 
 ### 6.3 Training data flow
@@ -393,20 +414,21 @@ models/train/
 ```
 
 `0000000` is the bootstrap model created for the current Learner invocation. The first
-successful Train Update publishes `0000001`. `manifest.pb` is the only authoritative
-public model manifest. `runtime/checkpoints` is private to the current invocation; it
+successful Train Update publishes `0000001`. `manifest.pb` contains the public model
+metadata. `runtime/checkpoints` is private to the current invocation; it
 is not part of a model package and is not an automatic resume entrypoint. The names
 and directories above are Learner's current local publication layout. Model
-Distributor validates the regular file selected by registration plus the size and
-content digest declared by `manifest.pb`; it does not treat `SaveModel.onnx` or seven-digit directories as a
-cross-component contract.
+Distributor validates lineage/step, the regular model file selected by registration,
+and its declared size; it preserves contiguous download offsets and records load
+ACKs. It computes no content hash and does not treat `SaveModel.onnx` or seven-digit
+directories as a cross-component contract.
 
 ## 7. Related repositories
 
 | Repository | Git URL | Responsibility |
 | --- | --- | --- |
 | rl-framework | [github.com/Achbite/rl-framework](https://github.com/Achbite/rl-framework) | Consolidated project documentation and read-only diagnostics. |
-| rl-contracts | [github.com/Achbite/rl-contracts](https://github.com/Achbite/rl-contracts) | Cross-language Proto, Schema, and contract artifacts. |
+| rl-contracts | [github.com/Achbite/rl-contracts](https://github.com/Achbite/rl-contracts) | Cross-language Proto sources and generated artifacts. |
 | rl-sample-pool | [github.com/Achbite/rl-sample-pool](https://github.com/Achbite/rl-sample-pool) | Sample Pool service and storage. |
 | rl-model-distributor | [github.com/Achbite/rl-model-distributor](https://github.com/Achbite/rl-model-distributor) | Model registration, download, and ACK service. |
 | rl-learner | [github.com/Achbite/rl-learner](https://github.com/Achbite/rl-learner) | PPO Learner, model publication, and local Monitor. |

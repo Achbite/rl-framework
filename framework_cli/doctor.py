@@ -6,14 +6,11 @@ import json
 import os
 import stat
 import subprocess
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Union
 
 
 SCHEMA_VERSION = 1
-CONTRACTS_VERSION = "0.15.0"
-ARTIFACT_PLATFORM = "linux/arm64"
-PLATFORM_DIRECTORY = "linux-arm64"
 
 REPOSITORIES = (
     "rl-contracts",
@@ -23,50 +20,22 @@ REPOSITORIES = (
     "rl-aiserver",
     "maze-client",
     "rl-framework",
-    "rl-infra",
 )
 
-ARTIFACT_SCHEMA = "rl.artifact-manifest.v1"
-ARTIFACTS = {
-    "rl-training-contracts": {
-        "storage_package": "rl-contracts",
-        "storage_suffix": ("training",),
-        "platform": None,
-        "required_files": {
-            "common.proto",
-            "training.proto",
-            "training_metrics.proto",
-            "cpp/common.pb.cc",
-            "cpp/training.pb.cc",
-            "cpp/training.grpc.pb.cc",
-            "cpp/training_metrics.pb.cc",
-            "python/common_pb2.py",
-            "python/training_pb2.py",
-            "python/training_pb2_grpc.py",
-            "python/training_metrics_pb2.py",
-            "schemas/training.metrics.json",
-        },
-        "required_executables": set(),
-    },
+LEARNER_RUNTIME_ARTIFACTS = {
     "rl-sample-pool": {
-        "storage_package": "rl-sample-pool",
-        "storage_suffix": (PLATFORM_DIRECTORY,),
-        "platform": ARTIFACT_PLATFORM,
-        "required_files": {
-            "bin/maze_sample_pool",
-            "config/pool_config.yaml",
+        "root": ("rl-learner", "sample-pool"),
+        "files": {
+            "bin/maze_sample_pool": True,
+            "config/pool_config.yaml": False,
         },
-        "required_executables": {"bin/maze_sample_pool"},
     },
     "rl-model-distributor": {
-        "storage_package": "rl-model-distributor",
-        "storage_suffix": (PLATFORM_DIRECTORY,),
-        "platform": ARTIFACT_PLATFORM,
-        "required_files": {
-            "bin/maze_model_distributor",
-            "config/model_distributor_config.yaml",
+        "root": ("rl-learner", "model-distributor"),
+        "files": {
+            "bin/maze_model_distributor": True,
+            "config/model_distributor_config.yaml": False,
         },
-        "required_executables": {"bin/maze_model_distributor"},
     },
 }
 
@@ -123,13 +92,6 @@ def _regular_file(path: Path) -> bool:
     )
 
 
-def _safe_artifact_path(relative: str) -> bool:
-    if not isinstance(relative, str) or not relative or "\\" in relative:
-        return False
-    candidate = PurePosixPath(relative)
-    return not candidate.is_absolute() and ".." not in candidate.parts
-
-
 def _git(
     repository: Path,
     arguments: list[str],
@@ -162,7 +124,7 @@ def doctor_source(
             "head": None,
             "dirty": None,
             "changed_paths": None,
-            "lifecycle": "legacy/disabled" if name == "rl-infra" else "active",
+            "lifecycle": "active",
         }
         repositories[name] = record
         if not path.is_dir():
@@ -210,140 +172,46 @@ def doctor_source(
         {
             "workspace_root": str(root),
             "repositories": repositories,
-            "infra": {
-                "repository": "rl-infra",
-                "lifecycle": "legacy/disabled",
-                "entered": False,
-            },
         },
         warnings,
         "; ".join(failures) if failures else None,
     )
 
 
-def _load_manifest(
-    path: Path,
-) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    if not _regular_file(path):
-        return None, f"manifest is missing or is not a regular file: {path}"
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        return None, f"manifest is invalid: {path}: {exc}"
-    if not isinstance(document, dict):
-        return None, f"manifest root is not an object: {path}"
-    return document, None
-
-
-def _verify_artifact(
+def _inspect_learner_runtime_artifact(
     root: Path,
     package: str,
-    contract_reference: dict[str, str],
 ) -> tuple[dict[str, Any], list[str]]:
-    specification = ARTIFACTS[package]
-    artifact_root = (
-        root
-        / ".workspace"
-        / "artifacts"
-        / specification["storage_package"]
-        / CONTRACTS_VERSION
-    )
-    for relative in specification["storage_suffix"]:
-        artifact_root /= relative
-    manifest_path = artifact_root / "manifest.json"
-    document, load_error = _load_manifest(manifest_path)
+    specification = LEARNER_RUNTIME_ARTIFACTS[package]
+    artifact_root = root.joinpath(*specification["root"])
     failures: list[str] = []
+    files: dict[str, Any] = {}
     output: dict[str, Any] = {
         "path": str(artifact_root),
-        "manifest": str(manifest_path),
-        "present": document is not None,
+        "present": artifact_root.is_dir(),
         "ok": False,
     }
-    if load_error or document is None:
-        failures.append(load_error or f"cannot load {package} manifest")
-        output["error"] = failures[-1]
-        return output, failures
-
-    expected_identity = [
-        ("schema_version", ARTIFACT_SCHEMA),
-        ("artifact_channel", "production"),
-        ("package", package),
-        ("version", CONTRACTS_VERSION),
-    ]
-    if specification["platform"] is not None:
-        expected_identity.append(("platform", specification["platform"]))
-    for key, expected in expected_identity:
-        if document.get(key) != expected:
+    for relative, executable in specification["files"].items():
+        path = artifact_root / relative
+        regular = _regular_file(path)
+        executable_ok = regular and (not executable or os.access(path, os.X_OK))
+        files[relative] = {
+            "path": str(path),
+            "regular_file": regular,
+            "executable": executable_ok if executable else None,
+            "size_bytes": path.stat().st_size if regular else None,
+        }
+        if not regular:
+            failures.append(f"{package} required file is missing: {relative}")
+        elif executable and not executable_ok:
             failures.append(
-                f"{package} manifest {key} mismatch: "
-                f"expected {expected!r}, found {document.get(key)!r}"
+                f"{package} binary is not executable: {relative}"
             )
-
-    files = document.get("files")
-    verified_files: dict[str, Any] = {}
-    if (
-        not isinstance(files, list)
-        or not files
-        or not all(isinstance(relative, str) for relative in files)
-    ):
-        failures.append(f"{package} files list is empty or invalid")
-    else:
-        declared = set(files)
-        required_files = ARTIFACTS[package]["required_files"]
-        missing = required_files - declared
-        if missing:
-            failures.append(
-                f"{package} does not declare required files: {sorted(missing)}"
-            )
-        for relative in sorted(declared):
-            if not _safe_artifact_path(relative):
-                failures.append(f"{package} contains unsafe path: {relative!r}")
-                continue
-            path = artifact_root / PurePosixPath(relative)
-            if not _regular_file(path):
-                failures.append(f"{package} file is missing: {relative}")
-                continue
-            verified_files[relative] = {
-                "size_bytes": path.stat().st_size,
-            }
-        required_executables = ARTIFACTS[package]["required_executables"]
-        manifest_executables = document.get("executables", [])
-        if package != "rl-training-contracts":
-            embedded_contract = document.get("contract")
-            if not isinstance(embedded_contract, dict) or any(
-                embedded_contract.get(key) != expected
-                for key, expected in contract_reference.items()
-            ):
-                failures.append(
-                    f"{package} uses an incompatible Contracts package"
-                )
-            if (
-                not isinstance(manifest_executables, list)
-                or not all(
-                    isinstance(relative, str)
-                    for relative in manifest_executables
-                )
-                or not required_executables.issubset(
-                    set(manifest_executables)
-                )
-            ):
-                failures.append(
-                    f"{package} executable declaration is incomplete"
-                )
-        for relative in required_executables:
-            path = artifact_root / PurePosixPath(relative)
-            if not _regular_file(path) or not os.access(path, os.X_OK):
-                failures.append(
-                    f"{package} executable is missing or not executable: {relative}"
-                )
 
     output.update(
         {
             "ok": not failures,
-            "version": document.get("version"),
-            "platform": document.get("platform"),
-            "contract": document.get("contract"),
-            "files": verified_files,
+            "files": files,
         }
     )
     if failures:
@@ -355,13 +223,9 @@ def doctor_artifacts(root: Optional[Path] = None) -> dict[str, Any]:
     root = (root or workspace_root()).absolute()
     artifacts: dict[str, Any] = {}
     failures: list[str] = []
-    contract_reference = {
-        "package": "rl-training-contracts",
-        "version": CONTRACTS_VERSION,
-    }
-    for package in ARTIFACTS:
-        inspected, package_failures = _verify_artifact(
-            root, package, contract_reference
+    for package in LEARNER_RUNTIME_ARTIFACTS:
+        inspected, package_failures = _inspect_learner_runtime_artifact(
+            root, package
         )
         artifacts[package] = inspected
         failures.extend(package_failures)
@@ -371,8 +235,6 @@ def doctor_artifacts(root: Optional[Path] = None) -> dict[str, Any]:
         not failures,
         {
             "workspace_root": str(root),
-            "required_version": CONTRACTS_VERSION,
-            "required_binary_platform": ARTIFACT_PLATFORM,
             "artifacts": artifacts,
         },
         error="; ".join(failures) if failures else None,
