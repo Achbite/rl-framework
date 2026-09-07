@@ -17,8 +17,4 @@ echo "[maze-protocol] synchronizing Client task inputs"
 RL_TRAINING_WORKSPACE="${workspace_root}" \
   bash "${workspace_root}/maze-client/scripts/sync_contract_snapshot.sh"
 
-echo "[maze-protocol] synchronizing Learner task metric inputs"
-RL_TRAINING_WORKSPACE="${workspace_root}" \
-  bash "${workspace_root}/rl-learner/proto/gen_proto.sh" task-maze
-
 echo "[maze-protocol] Maze task protocol files synchronized"
