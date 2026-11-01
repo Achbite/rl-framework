@@ -82,7 +82,7 @@ Learner 使用 Python，无需单独编译。启动后会依次运行 Sample Poo
 训练进程和本地 Monitor，并发布随机初始化的 `models/train/0000000/SaveModel.onnx`。默认启动会清理
 本次训练目录；如需使用已有权重，必须通过显式初始模型参数启动。
 
-Learner 会等待 AIServer 对 bootstrap 模型完成精确 ACK，等待期间保持运行属于正常状态。
+Learner 注册初始模型后便向 Pool 取批。AIServer 启动、加载模型并送入足够样本后，Learner 即可完成首个更新。
 
 ### 1.3 启动 AIServer
 

@@ -94,8 +94,7 @@ publishes a randomly initialized `models/train/0000000/SaveModel.onnx`. A defaul
 start clears the training directory for this invocation. Supplying existing weights
 requires an explicit initial-model argument.
 
-Learner waits for AIServer to issue an exact ACK for the bootstrap model. Remaining
-alive at that point is expected.
+Learner requests batches as soon as it registers the initial model. Once AIServer loads a model and enough samples reach the Pool, Learner can perform its first update.
 
 ### 1.3 Start AIServer
 
