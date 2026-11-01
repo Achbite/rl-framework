@@ -82,7 +82,7 @@ Learner 使用 Python，无需单独编译。启动后会依次运行 Sample Poo
 训练进程和本地 Monitor，并发布随机初始化的 `models/train/0000000/SaveModel.onnx`。默认启动会清理
 本次训练目录；如需使用已有权重，必须通过显式初始模型参数启动。
 
-Learner 会等待 AIServer 对 bootstrap 模型完成精确 ACK，等待期间保持运行属于正常状态。
+Learner 注册初始模型后便向 Pool 取批。AIServer 启动、加载模型并送入足够样本后，Learner 即可完成首个更新。
 
 ### 1.3 启动 AIServer
 
@@ -233,14 +233,15 @@ bash ./sync_artifacts.sh
 它会构建 `rl-contracts` 的 `training` profile，作为 Sample Pool 与 Model Distributor 本次编译的
 Proto 输入，再依次构建这两个服务，最后只把它们的二进制与配置同步到 Learner。同步始终更新二进制；
 目标配置不存在时才复制默认配置，已存在的本地配置不会被覆盖。
-Learner 的 Proto、AIServer/Client 的任务协议均不会被改写。脚本不下载仓库、不启动容器，
+Learner 的 Proto、AIServer/Client 的任务协议均不会被改写。脚本不下载仓库、不启动运行服务，
 也不调用控制面。以下命令是完全等价的手动流程：
 
 ```bash
-(cd rl-contracts && bash build_artifact.sh training)
-(cd rl-sample-pool && bash build_artifact.sh)
-(cd rl-model-distributor && bash build_artifact.sh)
-(cd rl-learner && bash scripts/sync_runtime_artifacts.sh)
+contract_dir="$(bash rl-contracts/build_artifact.sh training)"
+pool_dir="$(CONTRACT_CPP_DIR="${contract_dir}/cpp" bash rl-sample-pool/build_artifact.sh)"
+distributor_dir="$(CONTRACT_CPP_DIR="${contract_dir}/cpp" bash rl-model-distributor/build_artifact.sh)"
+bash rl-learner/scripts/sync_runtime_artifacts.sh \
+  --sample-pool-dir "${pool_dir}" --model-distributor-dir "${distributor_dir}"
 ```
 
 已经由其他环境提供制品时，也可以手工完成同一装配：将 `maze_sample_pool` 放到
@@ -257,8 +258,8 @@ AIServer 与 Client 的 `proto/` 属于各自源码，正常 `make shell`、构�
 bash ./sync_maze_protocol.sh
 ```
 
-该命令构建 `task-maze` profile，再按两个消费仓各自清单更新 Maze Task Proto 与生成的 C++
-bindings；它不是正常构建前置步骤。Proto 不可编译或 RPC wire 不一致会由真实
+该命令构建 `task-maze` profile，再按两个消费仓各自清单更新 Maze Task Proto 与 SDK；任务 C++
+bindings 在各自构建目录生成；它不是正常构建前置步骤。Proto 不可编译或 RPC wire 不一致会由真实
 Client↔AIServer 编译/通信失败暴露，不再用中央 artifact 的平台、源码哈希或自动回拉行为提前锁死。
 完成所需的显式同步后，即可进入三个组件仓分别执行 `make shell`，再在容器内按第 1 节编译和启动。
 
@@ -382,3 +383,17 @@ checkpoint，不属于模型包，也不是后续训练的自动恢复入口。�
 ## License
 
 [MIT License](LICENSE)
+
+## 构建输入与产物更新
+
+Framework 是组织仓，脚本只适用于 README 约定的同级仓库布局。各仓拥有自己的 build，默认产物在本仓
+`build/`；Framework 显式传入 `RL_ARTIFACT_ROOT` 将输出组织到 `.workspace/artifacts/`。
+`sync_artifacts.sh --development` 使用 `.workspace/dev-artifacts/`，两种通道共享各生产者的构建实现。
+
+`sync_artifacts.sh` 调用 Contracts 的 Training 构建入口，将返回的路径作为 Pool / Distributor 的
+`CONTRACT_CPP_DIR`，调用两仓 build，再调用 Learner 的显式装配入口。组件 build 不自动更新上游或同步消费仓。
+`sync_maze_protocol.sh` / `sync_training_protocol.sh` 分别显式采纳任务 / 训练协议；同步之后由消费仓自行 build。
+Learner 镜像只打包已装配的输入；AIServer / Client 镜像在各自源码上下文内编译并复用 BuildKit 编译缓存。
+要证明工作区当前源码进入镜像，先显式同步需要更新的协议和服务，再执行各仓 build/image 入口。
+
+开发容器 build 使用按工具链隔离的持久目录，构建成功后更新本仓 run 所用路径。各仓测试仍只通过根 `test.sh` 显式运行。

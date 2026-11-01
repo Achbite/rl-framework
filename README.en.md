@@ -94,8 +94,7 @@ publishes a randomly initialized `models/train/0000000/SaveModel.onnx`. A defaul
 start clears the training directory for this invocation. Supplying existing weights
 requires an explicit initial-model argument.
 
-Learner waits for AIServer to issue an exact ACK for the bootstrap model. Remaining
-alive at that point is expected.
+Learner requests batches as soon as it registers the initial model. Once AIServer loads a model and enough samples reach the Pool, Learner can perform its first update.
 
 ### 1.3 Start AIServer
 
@@ -260,14 +259,15 @@ stages only their binaries and configs into Learner. The binaries are always
 updated. A default config is copied only when the target config is absent, so an
 existing local config is preserved. Learner Proto and the
 AIServer/Client task protocol are not rewritten. The script downloads no
-repository, starts no container, and invokes no control plane. The equivalent
+repository, starts no runtime service, and invokes no control plane. The equivalent
 manual flow is:
 
 ```bash
-(cd rl-contracts && bash build_artifact.sh training)
-(cd rl-sample-pool && bash build_artifact.sh)
-(cd rl-model-distributor && bash build_artifact.sh)
-(cd rl-learner && bash scripts/sync_runtime_artifacts.sh)
+contract_dir="$(bash rl-contracts/build_artifact.sh training)"
+pool_dir="$(CONTRACT_CPP_DIR="${contract_dir}/cpp" bash rl-sample-pool/build_artifact.sh)"
+distributor_dir="$(CONTRACT_CPP_DIR="${contract_dir}/cpp" bash rl-model-distributor/build_artifact.sh)"
+bash rl-learner/scripts/sync_runtime_artifacts.sh \
+  --sample-pool-dir "${pool_dir}" --model-distributor-dir "${distributor_dir}"
 ```
 
 Artifacts supplied by another environment may instead be staged by hand. Put
@@ -438,3 +438,14 @@ directories as a cross-component contract.
 ## License
 
 [MIT License](LICENSE)
+
+## Build input and cache ownership
+
+Framework organizes the documented sibling layout. Each component owns its build and defaults
+to local `build/` outputs. Framework supplies `RL_ARTIFACT_ROOT` for `.workspace/artifacts/`;
+`sync_artifacts.sh --development` selects `.workspace/dev-artifacts/` using the same producer scripts.
+It invokes Contracts, passes the explicit `CONTRACT_CPP_DIR` to Pool and Distributor, invokes
+those builds and stages their returned outputs into Learner. Component builds never update upstream
+or synchronize consumers. `sync_maze_protocol.sh` and `sync_training_protocol.sh` explicitly adopt
+protocols; consumers then build themselves. Learner images package staged inputs; AIServer and
+Client images compile current source with BuildKit compiler caches. Tests remain explicit via `test.sh`.
