@@ -4,6 +4,9 @@
 
 本仓库是 RL Training Framework 的综合使用入口，提供当前项目的启动说明、架构说明和只读诊断工具。
 
+默认采用 CPU 异步 PPO：样本池单批无放回抽样、跨批允许复用；Learner 使用逐 minibatch
+更新和多 epoch。同步 On-policy、一次消费及整批并行梯度汇总属于显式对照试验选项。
+
 ## 目录
 
 - [1. 快速开始：本地三容器训练](#1-快速开始本地三容器训练)
@@ -319,7 +322,7 @@ Client 与 AIServer 只按双方源码中共同采用的 Maze Task Proto 通信�
 | Maze Client       | 加载地图、维护环境与 Agent 状态、执行 AIServer 下发的动作、报告终局状态并生成 Replay。                                                              |
 | AIServer          | 管理 Client session，执行 ONNX 推理与 Reward 计算；为每个 Agent 固定一个 segment 使用的模型，计算 GAE，并将离散 transition 交给 SampleDistributor。 |
 | SampleDistributor | AIServer 内的异步生产端；负责有界本地队列、批量 envelope、同一 payload 的有限重发和停止排空。                                                       |
-| Sample Pool       | Learner 容器内的样本后端；保存 processed transition，容量压力下按 FIFO 淘汰最老 READY 样本，并向 Learner 随机无放回交付租约批次。                   |
+| Sample Pool       | Learner 容器内的样本后端；默认保留 processed transition 供跨批复用，容量压力下按 FIFO 淘汰最老驻留样本，单批随机无放回抽取并交付独立快照。         |
 | Learner           | 从 Sample Pool 取得训练批次，执行 PPO forward/backward 与 optimizer update，提交样本处理结果并发布新模型。                                          |
 | Model Distributor | 注册 Learner 原子发布的模型包，按 lineage/step 提供精确模型下载，并记录 AIServer 的加载 ACK 事实。                                                  |
 | Framework         | 提供整个项目的使用说明、仓库导航和只读 doctor，不参与训练运行编排。                                                                                 |
@@ -337,13 +340,35 @@ Client 与 AIServer 只按双方源码中共同采用的 Maze Task Proto 通信�
    transition。segment close reason、bootstrap 和连续性校验是 AIServer 内部 producer 事实，不进入
    `ProcessedTransition`；Learner 只接收 PPO 所需字段及真实模型 provenance。
 5. SampleDistributor 将 transition 组成批量 envelope，异步发送到 Learner 容器内的 Sample Pool。
-6. Sample Pool 对 READY transition 进行随机无放回抽取。Learner 按
+6. Sample Pool 对驻留 transition 进行单批随机无放回抽取。Learner 按
    `configs/learner_config.yaml` 的 train batch、mini-batch 与 epoch 配置执行 PPO；成功提交后 ACK
-   并移除本批样本。
+   结算本批交付。默认 Replay 不删除驻留样本，同一条样本仍可供后续 batch 抽取；驻留生命周期
+   由容量 FIFO 淘汰和最终清理负责。
 7. Learner 完成一次更新后发布新的 `models/train/<model_step>/` 模型包。Model Distributor 暴露
    已发布模型，AIServer 下载、校验、Prepare 并精确 ACK，只在各 Agent 的 segment 边界激活新模型。
 8. Client、AIServer、Sample Pool、Learner 和模型分发链产生的事实进入本地 Monitor，展示真实的
    生产、接受、训练、模型更新、延迟和 Episode 指标。
+
+默认配置由各组件拥有：
+
+| Owner / 配置 | 默认值 | 语义 |
+| --- | --- | --- |
+| AIServer `rollout.collection_batch_size` | `0` | Actor 异步采样，不设置每批训练屏障 |
+| Pool `sampling.reuse` | `replay` | ACK 后保留驻留样本，允许跨 batch 复用 |
+| Pool `sampling.strategy` | `uniform_without_replacement` | 只禁止同一 batch 内重复抽到相同样本 |
+| Learner `training.device` / `training.update_mode` | `cpu` / `sequential_minibatch` | 每个 minibatch 单独执行 Adam |
+| Learner batch / minibatch / epochs | `4096` / `512` / `4` | 每个 Train Update 为 16,384 次梯度样本使用、32 次 Adam |
+
+本批 PPO 改造用于固定 Maze、相同初始模型和有限训练预算下的结构对照研究。
+`consume_once`、`synchronous_round` 控制跨 Update 一次消费；完全禁止梯度样本复用还须
+设置 `n_epochs: 1`。`parallel_batch` 将 4096 分为 8×512，在同一参数快照上计算梯度并
+汇总，每个 epoch 只执行一次 Adam。该试验同时改变批内复用与更新频率，不能把效果差异
+单独归因于其中一个因素，也不能把 8 个线程当作 8 核加速证据。
+试验选项保留为显式配置，默认架构继续采用 CPU 异步 Replay PPO；测试通过不代表通关或收敛。
+
+本地已装配的 Pool 配置位于 `rl-learner/sample-pool/config/pool_config.yaml`，也必须明确
+写入 `sampling.reuse: replay`。制品同步保留已有目标配置，采用当前合同后需核对；
+`SAMPLE_POOL_CONFIG` 覆盖路径时，由被选中的配置明确给出该值。
 
 ### 6.4 模型目录
 

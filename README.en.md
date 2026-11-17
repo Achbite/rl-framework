@@ -4,6 +4,11 @@
 
 This repository is the consolidated entry point for RL Training Framework usage, current architecture, and read-only diagnostics.
 
+The default is asynchronous PPO on CPU: sample without replacement within each
+batch and allow reuse across batches, with sequential minibatch updates and multiple
+epochs. Synchronous on-policy collection, consume-once delivery and parallel
+full-batch gradient aggregation are explicit experimental options.
+
 ## Table of contents
 
 - [1. Quick start: local three-container training](#1-quick-start-local-three-container-training)
@@ -361,7 +366,7 @@ command-line arguments may override them.
 | Maze Client | Load the map, maintain environment and Agent state, execute actions returned by AIServer, report terminal state, and generate Replay. |
 | AIServer | Manage Client sessions, perform ONNX inference and Reward calculation, pin one model per Agent segment, calculate GAE, and pass discrete transitions to SampleDistributor. |
 | SampleDistributor | AIServer's asynchronous producer: bounded local queue, batched envelopes, finite retransmission of the same payload, and shutdown drain. |
-| Sample Pool | Learner-container sample backend: store processed transitions, evict the oldest READY transitions by FIFO under capacity pressure, and lease uniformly sampled transitions without replacement to Learner. |
+| Sample Pool | Learner-container sample backend: retain processed transitions for reuse across batches by default, evict the oldest residents by FIFO under capacity pressure, and deliver independent snapshots sampled without replacement within each batch. |
 | Learner | Acquire training batches from Sample Pool, run PPO forward/backward and optimizer updates, commit sample outcomes, and publish new models. |
 | Model Distributor | Register atomically published Learner model packages, provide exact downloads by lineage/step, and record AIServer load ACK facts. |
 | Framework | Provide consolidated usage, repository navigation, and read-only doctor commands without participating in runtime orchestration. |
@@ -386,15 +391,43 @@ command-line arguments may override them.
    `ProcessedTransition`; Learner receives only PPO fields and real model provenance.
 5. SampleDistributor groups transitions into batched envelopes and sends them
    asynchronously to Sample Pool in the Learner container.
-6. Sample Pool draws READY transitions uniformly without replacement. Learner uses
+6. Sample Pool draws resident transitions uniformly without replacement within each batch. Learner uses
    the train-batch, mini-batch, and epoch settings in `configs/learner_config.yaml`,
-   then ACKs and removes the batch after a successful commit.
+   then ACKs the delivery after a successful commit. Default Replay retains resident
+   samples for later batches; capacity FIFO eviction and finalization own their
+   storage lifetime.
 7. After an update, Learner publishes a new `models/train/<model_step>/` package. Model
    Distributor exposes it; AIServer downloads, validates, prepares, and exactly ACKs
    it, then activates it only at each Agent's segment boundary.
 8. Facts emitted by Client, AIServer, Sample Pool, Learner, and the model distribution
    path feed the local Monitor, which presents production, acceptance, training, model
    update, latency, and Episode metrics without rewriting their values.
+
+Each component owns its default configuration:
+
+| Owner / configuration | Default | Meaning |
+| --- | --- | --- |
+| AIServer `rollout.collection_batch_size` | `0` | Asynchronous collection without a per-batch training barrier |
+| Pool `sampling.reuse` | `replay` | Keep resident samples after ACK for reuse across batches |
+| Pool `sampling.strategy` | `uniform_without_replacement` | Prevent duplicate items only within a batch |
+| Learner `training.device` / `training.update_mode` | `cpu` / `sequential_minibatch` | One Adam step per minibatch |
+| Learner batch / minibatch / epochs | `4096` / `512` / `4` | 16,384 gradient sample uses and 32 Adam steps per Train Update |
+
+This PPO work supports structural experiments on a fixed Maze with the same initial
+model and bounded training budgets. `consume_once` and `synchronous_round` prevent
+reuse across Updates; eliminating repeated gradient use also requires `n_epochs: 1`.
+`parallel_batch` splits 4096 samples into eight 512-sample shards, computes gradients
+against the same parameter snapshot, aggregates them, and takes one Adam step per
+epoch. The experiment changes both within-batch reuse and update frequency, so its
+outcomes cannot isolate either factor; eight threads do not establish eight-core
+speedup. These remain explicit experimental settings. CPU asynchronous Replay PPO
+remains the default, and passing tests does not establish task success or convergence.
+
+The locally staged Pool configuration at
+`rl-learner/sample-pool/config/pool_config.yaml` must also explicitly set
+`sampling.reuse: replay`. Artifact synchronization preserves existing target
+configuration, so check that field when adopting the current contract. If
+`SAMPLE_POOL_CONFIG` overrides the path, the selected file must provide it.
 
 ### 6.4 Model directories
 
